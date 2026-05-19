@@ -268,12 +268,14 @@ if mt_apply_mode; then
                 --permissions-with-grant-option "SELECT" "DESCRIBE" "ALTER" "INSERT" "DELETE" "DROP" \
                 --region "$REGION" 2>/dev/null || true
 
-            # IAM_ALLOWED_PRINCIPALS
-            mt_aws lakeformation grant-permissions \
-                --principal '{"DataLakePrincipalIdentifier":"IAM_ALLOWED_PRINCIPALS"}' \
-                --resource "{\"Table\":{\"DatabaseName\":\"${db}\",\"Name\":\"${table}\"}}" \
-                --permissions "SELECT" "DESCRIBE" \
-                --region "$REGION" 2>/dev/null || true
+            # NOTE: Intentionally NOT re-granting IAM_ALLOWED_PRINCIPALS on
+            # the table here. The migrate.sh `_lakeformation_bootstrap`
+            # helper revokes this default LF grant on every external
+            # Glue table so the table is "managed by Lake Formation".
+            # Restoring it here would put the table back into legacy
+            # IAM-default mode, which makes Iceberg's GlueCatalog treat
+            # the table as invisible (Spark surfaces this as
+            # `[TABLE_OR_VIEW_NOT_FOUND]` in Visual ETL).
         done
     done
 fi
