@@ -1,0 +1,4 @@
+customer_id,full_name,email,signup_date,country,segment,lifetime_value_usd
+42,Avery Cole,avery.cole@example.com,2024-08-12,US,RETAIL,1289.50
+77,Priya Singh,priya.singh@example.com,2024-09-30,IN,WHOLESALE,4720.00
+108,Daniel Mwangi,daniel.mwangi@example.com,2024-11-04,KE,RETAIL,219.75

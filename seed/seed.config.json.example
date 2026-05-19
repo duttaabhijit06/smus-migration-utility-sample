@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "seed_name_prefix": "smus-mig-seed",
+  "aws_region": "us-east-1",
+  "source_account_id": "123456789012",
+  "glue": {
+    "rds_instance_class": "db.t3.micro",
+    "rds_multi_az": false,
+    "sample_data_bucket_suffix": "sample-data"
+  },
+  "msk": {
+    "mode": "serverless",
+    "broker_instance_type": "kafka.t3.small"
+  },
+  "flink_kda": {
+    "kpu_count": 1
+  },
+  "lambda": {
+    "memory_mb": 128,
+    "timeout_seconds": 30
+  },
+  "mwaa": {
+    "environment_class": "mw1.small",
+    "airflow_version": "3.0.6"
+  }
+}

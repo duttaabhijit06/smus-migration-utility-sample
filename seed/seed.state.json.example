@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "last_updated_utc": null,
+  "services": {
+    "glue": {
+      "status": "pending",
+      "created_utc": null,
+      "resources": {}
+    },
+    "sns": {
+      "status": "pending",
+      "created_utc": null,
+      "resources": {}
+    },
+    "flink-kda": {
+      "status": "pending",
+      "created_utc": null,
+      "resources": {}
+    },
+    "msk": {
+      "status": "pending",
+      "created_utc": null,
+      "resources": {}
+    },
+    "lambda": {
+      "status": "pending",
+      "created_utc": null,
+      "resources": {}
+    },
+    "cloudwatch": {
+      "status": "pending",
+      "created_utc": null,
+      "resources": {}
+    },
+    "quicksight": {
+      "status": "pending",
+      "created_utc": null,
+      "resources": {}
+    },
+    "mwaa": {
+      "status": "pending",
+      "created_utc": null,
+      "resources": {}
+    }
+  }
+}

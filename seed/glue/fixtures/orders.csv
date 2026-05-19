@@ -1,0 +1,4 @@
+order_id,customer_id,order_date,sku,quantity,unit_price_usd,status
+1001,42,2025-01-03,WIDGET-A,2,19.99,SHIPPED
+1002,77,2025-01-04,GIZMO-B,1,49.50,PENDING
+1003,42,2025-01-05,WIDGET-A,5,19.99,DELIVERED
