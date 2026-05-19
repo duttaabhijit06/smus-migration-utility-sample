@@ -1,0 +1,28 @@
+{
+  "name": "test-et-write",
+  "role": "arn:aws:iam::571600872292:role/datazone_usr_role_cynxyg1bf9zk4n_dliux99pevfqjr",
+  "default_arguments": {
+    "--enable-glue-datacatalog": "true",
+    "author": "arn:aws:iam::571600872292:role/Admin",
+    "--job-bookmark-option": "job-bookmark-disable",
+    "--enable-lakeformation-fine-grained-access": "false",
+    "--TempDir": "s3://amazon-datazone-tooling-571600872292-us-east-1/dzd-6stcr0j6y0elwn/cynxyg1bf9zk4n/sys/glue/temp/",
+    "--smus-job-compute": "project.spark.compatibility",
+    "--enable-metrics": "true",
+    "--enable-spark-ui": "true",
+    "--smus-orig-asset": "jobs/dataflows/test-et-write.vetl",
+    "--spark-event-logs-path": "s3://amazon-datazone-tooling-571600872292-us-east-1/dzd-6stcr0j6y0elwn/cynxyg1bf9zk4n/sys/glue/spark/",
+    "--custom-logGroup-prefix": "datazone-cynxyg1bf9zk4n-dev",
+    "--enable-observability-metrics": "false",
+    "--conf": "spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.datasource.redshift.community.glue_endpoint=https://glue.us-east-1.amazonaws.com --conf spark.datasource.redshift.community.data_api_endpoint=https://redshift-data.us-east-1.amazonaws.com --conf spark.hadoop.fs.s3.impl=com.amazon.ws.emr.hadoop.fs.EmrFileSystem --conf spark.driver.maxResultSize=0 --conf spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog --conf spark.sql.catalog.spark_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.spark_catalog.glue.id=571600872292 --conf spark.sql.catalog.spark_catalog.glue.account-id=571600872292 --conf spark.sql.catalog.spark_catalog.glue.endpoint=https://glue.us-east-1.amazonaws.com --conf spark.sql.catalog.spark_catalog.client.region=us-east-1 --conf spark.extraListeners=io.openlineage.spark.agent.OpenLineageSparkListener --conf spark.openlineage.transport.type=amazon_datazone_api --conf spark.openlineage.transport.domainId=dzd-6stcr0j6y0elwn --conf spark.openlineage.facets.custom_environment_variables=[AWS_DEFAULT_REGION;GLUE_VERSION;GLUE_COMMAND_CRITERIA;GLUE_PYTHON_VERSION;] --conf spark.glue.accountId=571600872292 --conf spark.glue.JOB_NAME=test-et-write",
+    "--job-language": "python",
+    "--enable-auto-scaling": "true"
+  },
+  "connection_references": [
+    {
+      "original": "datazone-glue-network-connection-cynxyg1bf9zk4n-dev",
+      "smus_connection_name": null,
+      "smus_connection_id": null
+    }
+  ]
+}

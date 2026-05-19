@@ -1288,9 +1288,9 @@ _lakeformation_bootstrap() {
 # -----------------------------------------------------------------------------
 # _smus_session_bootstrap
 #
-# Fix the two infrastructure-level issues that prevent Glue interactive
-# sessions (Visual ETL, JupyterLab notebooks) from starting in a fresh
-# SMUS Tooling environment:
+# Fix the infrastructure-level issues that prevent Glue interactive
+# sessions, Athena Spark workgroups, and notebook Spark cells from
+# working in a fresh SMUS Tooling environment:
 #
 #   1. Lake Formation registrations on the DataZone tooling bucket
 #      ----------------------------------------------------------------
@@ -1309,6 +1309,19 @@ _lakeformation_bootstrap() {
 #      project user role. Hybrid mode lets IAM creds flow through when
 #      LF has no table covering the path.
 #
+#   1.5 Source S3 registrations need WithFederation=true for FGAC
+#      ----------------------------------------------------------------
+#      Athena Spark and Glue interactive sessions in fine-grained
+#      access mode call `lakeformation:GetTemporaryGlueTableCredentials`.
+#      LF returns `Access is not allowed` for any table whose
+#      registered S3 path was created without `WithFederation=true`.
+#      The default SLR-managed registrations cannot be updated to
+#      add WithFederation (LF returns `Resource managed by Service
+#      Linked Role`), so we create a dedicated registration role
+#      (`smus-seed-lf-registration-role`) and re-register every
+#      external Glue table's underlying S3 prefix using that role
+#      with `--with-federation --hybrid-access-enabled`.
+#
 #   2. Customer-managed KMS encryption on the tooling bucket
 #      ----------------------------------------------------------------
 #      The bucket is SSE-KMS with a customer-managed CMK created by
@@ -1322,6 +1335,22 @@ _lakeformation_bootstrap() {
 #      add a key policy statement allowing the project user role
 #      Encrypt/Decrypt/ReEncrypt*/GenerateDataKey*/DescribeKey via
 #      the s3 + glue services in the project's region.
+#
+#   3. LF data-lake settings need FGAC + every authorized session tag
+#      ----------------------------------------------------------------
+#      `AllowExternalDataFiltering`, `AllowFullTableExternalDataAccess`,
+#      `ExternalDataFilteringAllowList` (account allow-list), and
+#      `AuthorizedSessionTagValueList` (which includes "Amazon DataZone",
+#      "Amazon SageMaker", "Athena", and four others) all need to be
+#      set for FGAC notebook sessions to work. Section 0 below handles
+#      this BEFORE the per-prefix registrations.
+#
+#   4. Project user role needs `lakeformation:GetTemporaryGlue*Credentials`
+#      ----------------------------------------------------------------
+#      The AWS-managed `SageMakerStudioProjectUserRolePolicy` only
+#      grants the legacy `lakeformation:GetDataAccess`. FGAC needs the
+#      `Temporary*` variants — attached as an inline `LakeFormationFGACAccess`
+#      policy in section 0 below.
 #
 # Skip rules:
 #   * Skipped on dry-run.
@@ -1384,6 +1413,147 @@ _smus_session_bootstrap() {
     fi
     echo "==> SMUS session bootstrap: project user role ${_project_user_role##*/}"
 
+    # ---- 0. Enable LF external data filtering for SMUS notebook sessions ---
+    # SMUS Spark Connect (notebook) sessions call
+    # `lakeformation:GetTemporaryGlueTableCredentials` to vend per-table
+    # creds. Lake Formation refuses that call unless:
+    #
+    #   * `AllowExternalDataFiltering` is true at the data-lake-settings
+    #     level, AND
+    #   * the calling account (or an explicit principal) is in the
+    #     `ExternalDataFilteringAllowList`, AND
+    #   * the session tag value SMUS attaches ("Amazon DataZone") is in
+    #     the `AuthorizedSessionTagValueList`.
+    #
+    # Without all three, notebooks see:
+    #   org.apache.spark.fgac.error.AccessDeniedException:
+    #   Failed to retrieve AWS Lake Formation temporary credentials...
+    #
+    # We also attach `lakeformation:GetTemporaryGlue*Credentials` to
+    # the project user role; the AWS-managed policy has only the
+    # legacy `GetDataAccess` perm, which is the IAM half of the same
+    # problem.
+    local _lf_now _lf_new _lf_changed=0
+    _lf_now="$(aws lakeformation get-data-lake-settings --region "$_region" \
+        --query 'DataLakeSettings' --output json 2>/dev/null || echo '{}')"
+    _lf_new="$(printf '%s' "$_lf_now" | python3 -c '
+import json, os, sys
+s = json.load(sys.stdin)
+acct = os.environ["MT_ACCOUNT"]
+changed = False
+if not s.get("AllowExternalDataFiltering"):
+    s["AllowExternalDataFiltering"] = True
+    changed = True
+allow = s.get("ExternalDataFilteringAllowList") or []
+if not any((p.get("DataLakePrincipalIdentifier") == acct) for p in allow):
+    allow.append({"DataLakePrincipalIdentifier": acct})
+    s["ExternalDataFilteringAllowList"] = allow
+    changed = True
+tags = s.get("AuthorizedSessionTagValueList") or []
+# Authorized session-tag values cover every Spark/Athena engine SMUS
+# can launch:
+#   - "Amazon DataZone" / "Amazon SageMaker" / "Amazon SageMakerUnifiedStudio" — SMUS-managed Spark
+#   - "AWS Lake Formation Glue" / "Amazon EMR" — Glue interactive sessions, EMR Serverless
+#   - "Athena" / "Amazon Athena" — Athena Spark workgroups (notebook SQL cells set to "Athena (Spark)")
+for v in ["Amazon DataZone", "Amazon SageMaker", "Amazon SageMakerUnifiedStudio", "AWS Lake Formation Glue", "Amazon EMR", "Athena", "Amazon Athena"]:
+    if v not in tags:
+        tags.append(v)
+        changed = True
+s["AuthorizedSessionTagValueList"] = tags
+# AllowFullTableExternalDataAccess is required for Athena Spark and
+# Glue interactive sessions to vend full-table credentials via
+# `lakeformation:GetTemporaryGlueTableCredentials`. Without it, FGAC
+# returns AccessDeniedException even when the principal has SELECT on
+# the table.
+if not s.get("AllowFullTableExternalDataAccess"):
+    s["AllowFullTableExternalDataAccess"] = True
+    changed = True
+print(json.dumps(s))
+print("CHANGED" if changed else "UNCHANGED", file=sys.stderr)
+' 2>/tmp/_lf_changed_marker.txt || echo "{}")"
+    if grep -q CHANGED /tmp/_lf_changed_marker.txt 2>/dev/null; then
+        _lf_changed=1
+    fi
+    rm -f /tmp/_lf_changed_marker.txt
+    if [ "$_lf_changed" -eq 1 ]; then
+        local _lf_tmp
+        _lf_tmp="$(mktemp -t "smus-lf-fgac-XXXXXX.json")"
+        printf '%s' "$_lf_new" > "$_lf_tmp"
+        if MT_ACCOUNT="$_account" aws lakeformation put-data-lake-settings \
+                --data-lake-settings "file://${_lf_tmp}" \
+                --region "$_region" >/dev/null 2>&1; then
+            echo "    + LF external-data-filtering enabled + account ${_account} allow-listed + 'Amazon DataZone' session tag authorized"
+        else
+            echo "    WARN: put-data-lake-settings failed; FGAC notebook sessions may still see 'Access is not allowed'"
+        fi
+        rm -f "$_lf_tmp"
+    else
+        echo "    = LF external-data-filtering already enabled + account allow-listed"
+    fi
+
+    # IAM half: project user role needs lakeformation:GetTemporary*
+    # Glue*Credentials — the AWS-managed
+    # `SageMakerStudioProjectUserRolePolicy` has only the legacy
+    # `lakeformation:GetDataAccess`, which doesn't cover FGAC.
+    local _fgac_iam
+    _fgac_iam="$(jq -n '{
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "LakeFormationFGACCredentials",
+            Effect: "Allow",
+            Action: [
+                "lakeformation:GetTemporaryGlueTableCredentials",
+                "lakeformation:GetTemporaryGluePartitionCredentials"
+            ],
+            Resource: "*"
+        }]
+    }')"
+    if aws iam put-role-policy \
+            --role-name "${_project_user_role##*/}" \
+            --policy-name LakeFormationFGACAccess \
+            --policy-document "$_fgac_iam" >/dev/null 2>&1; then
+        echo "    + LakeFormationFGACAccess inline policy applied to ${_project_user_role##*/}"
+    fi
+
+    # IAM half (continued): the AWS-managed `SageMakerStudioProjectUserRolePolicy`
+    # gates `glue:GetTable*` on `glue:LakeFormationPermissions=Enabled`,
+    # which evaluates to false when the table isn't fully LF-managed.
+    # Glue interactive sessions (GlueJobRunnerSession) calling
+    # `glue:GetTable` against external Glue tables then hit:
+    #   "User: ... is not authorized to perform: glue:GetTable on
+    #    resource: arn:aws:glue:...table/<db>/<table>"
+    # We attach an unconditional Glue catalog read inline policy so
+    # the session can resolve external table metadata regardless of
+    # the LakeFormationPermissions condition.
+    local _glue_read_iam
+    _glue_read_iam="$(jq -n '{
+        Version: "2012-10-17",
+        Statement: [{
+            Sid: "GlueCatalogReadUnconditional",
+            Effect: "Allow",
+            Action: [
+                "glue:GetCatalog","glue:GetCatalogs",
+                "glue:GetDatabase","glue:GetDatabases",
+                "glue:GetTable","glue:GetTables",
+                "glue:GetTableVersion","glue:GetTableVersions",
+                "glue:GetPartition","glue:GetPartitions",
+                "glue:BatchGetPartition","glue:SearchTables"
+            ],
+            Resource: [
+                "arn:aws:glue:*:*:catalog",
+                "arn:aws:glue:*:*:catalog/*",
+                "arn:aws:glue:*:*:database/*",
+                "arn:aws:glue:*:*:table/*/*"
+            ]
+        }]
+    }')"
+    if aws iam put-role-policy \
+            --role-name "${_project_user_role##*/}" \
+            --policy-name GlueCatalogReadAccess \
+            --policy-document "$_glue_read_iam" >/dev/null 2>&1; then
+        echo "    + GlueCatalogReadAccess inline policy applied to ${_project_user_role##*/}"
+    fi
+
     # ---- 1. Lake Formation registrations on the tooling bucket -------------
     local _project_path="${_bucket}/dzd-${_domain_id#dzd-}/${_project_id}/dev"
     local _bucket_arn="arn:aws:s3:::${_bucket}"
@@ -1425,6 +1595,151 @@ _smus_session_bootstrap() {
             --region "$_region" >/dev/null 2>&1 || \
             echo "    WARN: LF register-resource failed for ${_project_arn}"
         echo "    + LF /dev registered hybrid (role=${_project_user_role##*/})"
+    fi
+
+    # ---- 1.5 Source S3 registrations need WithFederation=true for FGAC ----
+    # Athena Spark workgroups and Glue interactive sessions in FGAC mode
+    # call `lakeformation:GetTemporaryGlueTableCredentials` to vend
+    # per-table credentials. LF returns `AccessDeniedException: Access
+    # is not allowed` for any table whose underlying S3 location is
+    # registered without `WithFederation=true` — even when every other
+    # FGAC requirement (allow-list, session tag, IAM perm, table grant)
+    # is satisfied.
+    #
+    # The default SLR-managed registrations created by Glue jobs /
+    # crawlers can NOT be updated with WithFederation (LF returns
+    # `Resource managed by Service Linked Role`). Workaround:
+    #   1. Ensure a dedicated registration role exists with S3 RW +
+    #      glue:Get* + lakeformation:GetDataAccess perms and a trust
+    #      policy that lets lakeformation.amazonaws.com assume it.
+    #   2. For every seed S3 prefix backed by a Glue table, deregister
+    #      the SLR-managed registration and re-register with the new
+    #      role + --hybrid-access-enabled + --with-federation.
+    #
+    # Scope: we walk every Glue table in every external Glue DB, take
+    # the unique set of S3 prefixes (bucket + bucket/prefix), and
+    # re-register each. Skipping `glue_db_*` (project-managed) keeps us
+    # away from the SMUS-managed lakehouse paths.
+
+    # 1.5a. Discover the dedicated registration role; create it if missing.
+    local _reg_role_name="smus-seed-lf-registration-role"
+    local _reg_role_arn="arn:aws:iam::${_account}:role/${_reg_role_name}"
+    if ! aws iam get-role --role-name "$_reg_role_name" >/dev/null 2>&1; then
+        local _reg_trust _reg_policy
+        _reg_trust='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":["lakeformation.amazonaws.com","glue.amazonaws.com"]},"Action":"sts:AssumeRole"}]}'
+        _reg_policy="$(jq -n '{
+            Version: "2012-10-17",
+            Statement: [
+                {
+                    Sid: "S3DataAccess",
+                    Effect: "Allow",
+                    Action: ["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation","s3:GetBucketAcl"],
+                    Resource: "*"
+                },
+                {
+                    Sid: "GlueAccess",
+                    Effect: "Allow",
+                    Action: ["glue:GetTable","glue:GetTables","glue:GetDatabase","glue:GetDatabases"],
+                    Resource: "*"
+                },
+                {
+                    Sid: "LakeFormationDataAccess",
+                    Effect: "Allow",
+                    Action: ["lakeformation:GetDataAccess","lakeformation:GrantPermissions"],
+                    Resource: "*"
+                }
+            ]
+        }')"
+        if aws iam create-role --role-name "$_reg_role_name" \
+                --assume-role-policy-document "$_reg_trust" \
+                >/dev/null 2>&1; then
+            aws iam put-role-policy --role-name "$_reg_role_name" \
+                --policy-name LFRegistrationPolicy \
+                --policy-document "$_reg_policy" >/dev/null 2>&1 || true
+            echo "    + created LF registration role ${_reg_role_name}"
+            # Brief pause so IAM consistency catches up before LF tries to
+            # assume the new role during register-resource.
+            sleep 8
+        else
+            echo "    WARN: failed to create ${_reg_role_name}; skipping WithFederation re-registration"
+            _reg_role_arn=""
+        fi
+    fi
+
+    # 1.5b. Walk every external Glue DB, collect unique S3 prefixes,
+    # deregister + re-register with WithFederation=true.
+    if [ -n "$_reg_role_arn" ]; then
+        local _all_dbs _ext_db _all_locations
+        _all_dbs="$(aws glue get-databases --region "$_region" --output json 2>/dev/null \
+            | jq -r '.DatabaseList[]?.Name' 2>/dev/null || true)"
+        # Collect every table location into a deduped set.
+        _all_locations=""
+        while IFS= read -r _ext_db; do
+            [ -z "$_ext_db" ] && continue
+            case "$_ext_db" in glue_db_*) continue ;; esac
+            local _locs
+            _locs="$(aws glue get-tables --region "$_region" \
+                --database-name "$_ext_db" --output json 2>/dev/null \
+                | jq -r '.TableList[]?.StorageDescriptor.Location // empty' \
+                2>/dev/null || true)"
+            _all_locations="${_all_locations}${_locs}
+"
+        done <<<"$_all_dbs"
+
+        # Build the set of ARNs to register: each table's exact S3 prefix
+        # (as ARN form) PLUS the bucket-root ARN. Deduplicate via sort -u.
+        local _arns_to_register
+        _arns_to_register="$(printf '%s' "$_all_locations" | python3 -c '
+import sys
+arns = set()
+for line in sys.stdin:
+    loc = line.strip()
+    if not loc.startswith("s3://"):
+        continue
+    # Strip s3:// and trailing slash.
+    body = loc[5:].rstrip("/")
+    if not body:
+        continue
+    parts = body.split("/", 1)
+    bucket = parts[0]
+    arns.add(f"arn:aws:s3:::{bucket}")
+    if len(parts) > 1 and parts[1]:
+        arns.add(f"arn:aws:s3:::{bucket}/{parts[1]}")
+for a in sorted(arns):
+    print(a)
+')"
+        local _to_register_count
+        _to_register_count="$(printf '%s' "$_arns_to_register" | grep -c . 2>/dev/null || echo 0)"
+
+        if [ "${_to_register_count:-0}" != "0" ]; then
+            echo "    + re-registering ${_to_register_count} source S3 prefix(es) with WithFederation=true"
+            local _arn_to_reg _existing_role
+            while IFS= read -r _arn_to_reg; do
+                [ -z "$_arn_to_reg" ] && continue
+                # If already registered with our custom role, leave it
+                # alone (idempotent). Otherwise deregister + re-register.
+                _existing_role="$(aws lakeformation describe-resource \
+                    --resource-arn "$_arn_to_reg" --region "$_region" \
+                    --query 'ResourceInfo.RoleArn' --output text 2>/dev/null \
+                    | grep -v '^None$' || true)"
+                if [ "$_existing_role" = "$_reg_role_arn" ]; then
+                    continue
+                fi
+                if [ -n "$_existing_role" ]; then
+                    aws lakeformation deregister-resource \
+                        --resource-arn "$_arn_to_reg" --region "$_region" \
+                        >/dev/null 2>&1 || true
+                fi
+                aws lakeformation register-resource \
+                    --resource-arn "$_arn_to_reg" \
+                    --role-arn "$_reg_role_arn" \
+                    --hybrid-access-enabled \
+                    --with-federation \
+                    --region "$_region" >/dev/null 2>&1 || \
+                    echo "    WARN: register-resource with-federation failed for ${_arn_to_reg##*/}"
+            done <<<"$_arns_to_register"
+            echo "    + WithFederation registrations complete"
+        fi
     fi
 
     # ---- 2. KMS key policy on the tooling bucket's CMK ---------------------
@@ -1499,6 +1814,147 @@ _smus_session_bootstrap() {
     fi
 
     echo "==> SMUS session bootstrap: complete"
+}
+
+# -----------------------------------------------------------------------------
+# _smus_codecommit_grant
+#
+# Attach a CodeCommit Git-ops inline policy to the project user role so
+# users in the JupyterLab Space can `git clone`, `git fetch`, and
+# `git push` against the project's CodeCommit repo.
+#
+# Why this matters:
+# The SMUS `SageMakerStudioProjectUserRolePolicy` AWS-managed policy
+# attached to `datazone_usr_role_<project>_<env>` does NOT include
+# `codecommit:GitPull` / `codecommit:GitPush`. Without these, users in
+# the Space hit `403` from CodeCommit even when `git-remote-codecommit`
+# is correctly configured — the helper successfully signs the request
+# and CodeCommit rejects it.
+#
+# The grant is scoped to the migration's CodeCommit repo (resolved
+# from `MT_REPO_NAME` / config) plus a global `ListRepositories` so
+# the SMUS portal's Code tab can list repos.
+#
+# Skip rules:
+#   * Skipped on dry-run.
+#   * Skipped when the configured Repo_Provider is not codecommit.
+#   * Skipped if domain/project IDs aren't set yet.
+#   * Skipped if the project user role can't be discovered.
+#
+# Idempotency: `put-role-policy` is replace-or-create.
+# -----------------------------------------------------------------------------
+
+_smus_codecommit_grant() {
+    if [ "$MODE_FLAG" != "--apply" ]; then
+        echo "==> SMUS CodeCommit grant: skipped (not in --apply mode)"
+        return 0
+    fi
+
+    local _repo_provider="${MT_REPO_PROVIDER:-}"
+    if [ -z "$_repo_provider" ] && command -v jq >/dev/null 2>&1; then
+        _repo_provider="$(jq -r '.repo_provider // empty' \
+            "${ROOT_DIR}/config/migration.config.json" 2>/dev/null || true)"
+    fi
+    if [ "$_repo_provider" != "codecommit" ]; then
+        echo "==> SMUS CodeCommit grant: skipped (repo_provider=${_repo_provider:-unset})"
+        return 0
+    fi
+
+    local _domain_id="${MT_SMUS_DOMAIN_ID:-}"
+    local _project_id="${MT_ADMIN_PROJECT_ID:-}"
+    if [ -z "$_domain_id" ] || [ -z "$_project_id" ]; then
+        echo "==> SMUS CodeCommit grant: skipped (domain/project ID not set yet)"
+        return 0
+    fi
+
+    local _region="${AWS_DEFAULT_REGION:-us-east-1}"
+    local _account
+    _account="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")"
+    if [ -z "$_account" ]; then
+        echo "==> SMUS CodeCommit grant: skipped (no caller account)"
+        return 0
+    fi
+
+    # Discover the project user role ARN via the Tooling environment.
+    local _tooling_env_id _project_user_role
+    _tooling_env_id="$(aws datazone list-environments \
+        --domain-identifier "$_domain_id" \
+        --project-identifier "$_project_id" \
+        --region "$_region" --output json 2>/dev/null \
+        | jq -r '.items[]? | select(.name == "Tooling") | .id' | head -n 1)"
+    if [ -z "$_tooling_env_id" ]; then
+        echo "==> SMUS CodeCommit grant: WARN — Tooling env not found; skipping"
+        return 0
+    fi
+    _project_user_role="$(aws datazone get-environment \
+        --domain-identifier "$_domain_id" \
+        --identifier "$_tooling_env_id" \
+        --region "$_region" \
+        --query 'provisionedResources[?name==`userRoleArn`].value | [0]' \
+        --output text 2>/dev/null | grep -v '^None$' || true)"
+    if [ -z "$_project_user_role" ]; then
+        echo "==> SMUS CodeCommit grant: WARN — userRoleArn not yet provisioned; skipping"
+        return 0
+    fi
+    local _role_name="${_project_user_role##*/}"
+
+    # Resolve the repo name from MT_REPO_NAME or migration.config.json.
+    local _repo_name="${MT_REPO_NAME:-}"
+    if [ -z "$_repo_name" ] && command -v jq >/dev/null 2>&1; then
+        _repo_name="$(jq -r '.repo_name // empty' \
+            "${ROOT_DIR}/config/migration.config.json" 2>/dev/null || true)"
+    fi
+    if [ -z "$_repo_name" ]; then
+        echo "==> SMUS CodeCommit grant: WARN — repo_name not resolvable; skipping"
+        return 0
+    fi
+    local _repo_arn="arn:aws:codecommit:${_region}:${_account}:${_repo_name}"
+
+    # Build the inline policy: repo-scoped Git ops + account-wide
+    # ListRepositories (needed by the SMUS portal's repo browser).
+    local _policy_doc
+    _policy_doc="$(jq -n \
+        --arg arn "$_repo_arn" \
+        '{
+            Version: "2012-10-17",
+            Statement: [
+                {
+                    Sid: "CodeCommitGitOps",
+                    Effect: "Allow",
+                    Action: [
+                        "codecommit:GitPull",
+                        "codecommit:GitPush",
+                        "codecommit:GetRepository",
+                        "codecommit:GetBranch",
+                        "codecommit:GetReferences",
+                        "codecommit:ListBranches",
+                        "codecommit:CreateBranch",
+                        "codecommit:UpdateDefaultBranch",
+                        "codecommit:GetRepositoryTriggers",
+                        "codecommit:BatchGetCommits",
+                        "codecommit:GetCommit",
+                        "codecommit:GetDifferences",
+                        "codecommit:CreateCommit",
+                        "codecommit:GetTree"
+                    ],
+                    Resource: $arn
+                },
+                {
+                    Sid: "CodeCommitListRepos",
+                    Effect: "Allow",
+                    Action: ["codecommit:ListRepositories"],
+                    Resource: "*"
+                }
+            ]
+        }')"
+    if aws iam put-role-policy \
+            --role-name "$_role_name" \
+            --policy-name CodeCommitAccess \
+            --policy-document "$_policy_doc" >/dev/null 2>&1; then
+        echo "==> SMUS CodeCommit grant: + inline CodeCommitAccess applied to ${_role_name} (repo=${_repo_arn})"
+    else
+        echo "==> SMUS CodeCommit grant: WARN — put-role-policy failed; users may see 403 from CodeCommit"
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1789,6 +2245,15 @@ _action_run() {
     # Idempotent — re-running on a fixed env is a no-op.
     _smus_session_bootstrap
 
+    # Attach a CodeCommit Git-ops inline policy to the project user
+    # role so users in JupyterLab Spaces can `git clone` / `git push`
+    # against the project's CodeCommit repo. The default
+    # `SageMakerStudioProjectUserRolePolicy` doesn't include
+    # codecommit:GitPull / GitPush, so without this the Space hits
+    # 403 from CodeCommit. No-op when the configured Repo_Provider
+    # is not codecommit.
+    _smus_codecommit_grant
+
     # Auto-subscribe the admin project to its own published Glue
     # assets. Without this, external Glue tables in the seed DBs are
     # marked "Asset cannot be queried with tools" in Visual ETL even
@@ -1907,7 +2372,9 @@ _action_run() {
 #      added to the tooling-bucket KMS key policy.
 #   4. Detach the IAM inline policies Step 3 added to the project
 #      user role (`GlueSparkLogsAccess`, `GlueDataBucketAccess`,
-#      `GlueConnectionAccess`). Skipped when --keep-iam-roles.
+#      `GlueConnectionAccess`, `CodeCommitAccess`,
+#      `LakeFormationFGACAccess`, `GlueCatalogReadAccess`). Skipped
+#      when --keep-iam-roles.
 #   5. Delete the SMUS CFN stack via the hardened
 #      `_teardown_destroy_smus_stack` helper. Skipped when
 #      --keep-cfn. The helper handles the five known SMUS
@@ -1935,7 +2402,7 @@ _action_run() {
 # -----------------------------------------------------------------------------
 # _teardown_destroy_smus_stack <apply> <region> <domain_id> <project_id>
 #
-# Hardened SMUS CFN stack deletion that handles the five failure modes
+# Hardened SMUS CFN stack deletion that handles the six failure modes
 # the bare `delete-stack` hits in practice:
 #
 #   1. The DataZone Tooling environment fails to delete because its
@@ -1956,6 +2423,12 @@ _action_run() {
 #      ownership row is already gone. CFN can't reconcile and aborts.
 #   5. Sub-stacks finish deleting in stages, so the parent has to be
 #      retried after each unblock.
+#   6. SMUS auto-creates `glue_db_<env_id>` Glue databases for the
+#      Lakehouse Database environment but doesn't include them in
+#      any CFN stack. They survive teardown as orphaned DBs that show
+#      up in the next deployment's Catalog tree pointing at long-gone
+#      tables. We drop them here, scoped by domain-id match on
+#      `LocationUri`.
 #
 # Strategy:
 #
@@ -2116,6 +2589,39 @@ _teardown_destroy_smus_stack() {
                 echo "    WARN: env ${_env_id} ended in ${_env_status}; CFN delete will likely fail again"
             fi
         done <<<"$_envs_json"
+    fi
+
+    # ---- B'. Drop orphaned project-managed Glue DBs (failure mode 6). ----
+    # SMUS auto-creates `glue_db_<env_id>` for every Lakehouse Database
+    # environment but doesn't include it in the env's CFN sub-stack —
+    # so `delete-environment` leaves the Glue DB and its resource
+    # links behind. They show up in the next deployment's SMUS
+    # Catalog tree as confusing "ghost" entries pointing at long-gone
+    # source tables.
+    #
+    # We identify project-managed DBs by `LocationUri` containing the
+    # current domain id; that match is precise enough to avoid
+    # touching unrelated Glue DBs in the same account.
+    if [ -n "$_domain_id" ]; then
+        local _orphan_dbs _db
+        _orphan_dbs="$(aws glue get-databases --region "$_region" \
+            --output json 2>/dev/null \
+            | jq -r --arg d "$_domain_id" \
+                '.DatabaseList[]? | select(.Name | startswith("glue_db_")) | select((.LocationUri // "") | contains($d)) | .Name' \
+            2>/dev/null || true)"
+        while IFS= read -r _db; do
+            [ -z "$_db" ] && continue
+            echo "    + dropping orphaned project DB ${_db}"
+            local _t
+            for _t in $(aws glue get-tables --database-name "$_db" \
+                    --region "$_region" --output json 2>/dev/null \
+                    | jq -r '.TableList[]?.Name' 2>/dev/null); do
+                aws glue delete-table --database-name "$_db" --name "$_t" \
+                    --region "$_region" >/dev/null 2>&1 || true
+            done
+            aws glue delete-database --name "$_db" --region "$_region" \
+                >/dev/null 2>&1 || true
+        done <<<"$_orphan_dbs"
     fi
 
     # ---- C. Strip dangling principals from LF data-lake admins. --------
@@ -2414,7 +2920,7 @@ _action_teardown() {
         echo "==> teardown 4/6: detaching IAM inline policies from project user role"
         local _role_name="${_project_user_role##*/}"
         local _pol
-        for _pol in GlueSparkLogsAccess GlueDataBucketAccess GlueConnectionAccess; do
+        for _pol in GlueSparkLogsAccess GlueDataBucketAccess GlueConnectionAccess CodeCommitAccess LakeFormationFGACAccess GlueCatalogReadAccess; do
             if [ "$_apply" -eq 1 ]; then
                 if aws iam delete-role-policy --role-name "$_role_name" \
                         --policy-name "$_pol" >/dev/null 2>&1; then
@@ -2428,6 +2934,23 @@ _action_teardown() {
         done
     else
         echo "==> teardown 4/6: project user role not discovered; skipping IAM cleanup"
+    fi
+
+    # ---- 4b. Delete the dedicated LF registration role we created. -----
+    # `smus-seed-lf-registration-role` is created by `_smus_session_bootstrap`
+    # so it can re-register source S3 prefixes with --with-federation.
+    # The role outlives the CFN stack (it's not in any stack), so drop
+    # it explicitly here unless --keep-iam-roles.
+    if [ "$TEARDOWN_KEEP_IAM" -ne 1 ] && [ "$_apply" -eq 1 ]; then
+        if aws iam get-role --role-name smus-seed-lf-registration-role \
+                >/dev/null 2>&1; then
+            aws iam delete-role-policy --role-name smus-seed-lf-registration-role \
+                --policy-name LFRegistrationPolicy >/dev/null 2>&1 || true
+            if aws iam delete-role --role-name smus-seed-lf-registration-role \
+                    >/dev/null 2>&1; then
+                echo "    + deleted LF registration role smus-seed-lf-registration-role"
+            fi
+        fi
     fi
 
     # ---- 5. Delete the SMUS CFN stack (with hardening passes). ----
