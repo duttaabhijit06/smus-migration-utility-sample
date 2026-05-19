@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  SMUS bootstrap — policy grants. Grants CONTRIBUTOR projects in the
+  root domain unit permission to create environments from each of the
+  17 blueprints, and grants all users permission to create projects
+  from the 3 named project profiles.
+
+# Equivalent to aws/Unified-Studio-for-Amazon-Sagemaker
+# /main/cloudformation/domain/policy_grant.yaml. The upstream version
+# uses Fn::ForEach (AWS::LanguageExtensions transform); we expand the
+# loop manually here so this nested stack does not need a transform
+# declaration.
+
+Parameters:
+  DomainId:
+    Type: String
+  AccountId:
+    Type: String
+  DomainUnitId:
+    Type: String
+
+  LakehouseCatalogId:
+    Type: String
+  AmazonBedrockGuardrailId:
+    Type: String
+  MLExperimentsId:
+    Type: String
+  ToolingId:
+    Type: String
+  RedshiftServerlessId:
+    Type: String
+  EmrServerlessId:
+    Type: String
+  WorkflowsId:
+    Type: String
+  AmazonBedrockPromptId:
+    Type: String
+  DataLakeId:
+    Type: String
+  AmazonBedrockEvaluationId:
+    Type: String
+  AmazonBedrockKnowledgeBaseId:
+    Type: String
+  PartnerAppsId:
+    Type: String
+  AmazonBedrockChatAgentId:
+    Type: String
+  AmazonBedrockFunctionId:
+    Type: String
+  AmazonBedrockFlowId:
+    Type: String
+  EmrOnEc2Id:
+    Type: String
+  QuickSightId:
+    Type: String
+
+  SQLAnalyticsProfileId:
+    Type: String
+  AllCapabilitiesProjectProfileId:
+    Type: String
+  GenerativeAIApplicationDevelopmentProfileId:
+    Type: String
+
+Resources:
+  AddPolicyGrantForLakehouseCatalog:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${LakehouseCatalogId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForAmazonBedrockGuardrail:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${AmazonBedrockGuardrailId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForMLExperiments:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${MLExperimentsId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForTooling:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${ToolingId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForRedshiftServerless:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${RedshiftServerlessId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForEmrServerless:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${EmrServerlessId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForWorkflows:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${WorkflowsId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForAmazonBedrockPrompt:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${AmazonBedrockPromptId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForDataLake:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${DataLakeId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForAmazonBedrockEvaluation:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${AmazonBedrockEvaluationId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForAmazonBedrockKnowledgeBase:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${AmazonBedrockKnowledgeBaseId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForPartnerApps:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${PartnerAppsId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForAmazonBedrockChatAgent:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${AmazonBedrockChatAgentId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForAmazonBedrockFunction:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${AmazonBedrockFunctionId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForAmazonBedrockFlow:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${AmazonBedrockFlowId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForEmrOnEc2:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${EmrOnEc2Id}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForQuickSight:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: ENVIRONMENT_BLUEPRINT_CONFIGURATION
+      EntityIdentifier: !Sub '${AccountId}:${QuickSightId}'
+      PolicyType: CREATE_ENVIRONMENT_FROM_BLUEPRINT
+      Detail:
+        CreateEnvironmentFromBlueprint: {}
+      Principal:
+        Project:
+          ProjectDesignation: CONTRIBUTOR
+          ProjectGrantFilter:
+            DomainUnitFilter:
+              DomainUnit: !Ref DomainUnitId
+              IncludeChildDomainUnits: true
+
+  AddPolicyGrantForProfiles:
+    Type: AWS::DataZone::PolicyGrant
+    Properties:
+      DomainIdentifier: !Ref DomainId
+      EntityType: DOMAIN_UNIT
+      EntityIdentifier: !Ref DomainUnitId
+      PolicyType: CREATE_PROJECT_FROM_PROJECT_PROFILE
+      Detail:
+        CreateProjectFromProjectProfile:
+          IncludeChildDomainUnits: true
+          ProjectProfiles:
+            - !Ref SQLAnalyticsProfileId
+            - !Ref AllCapabilitiesProjectProfileId
+            - !Ref GenerativeAIApplicationDevelopmentProfileId
+      Principal:
+        User:
+          AllUsersGrantFilter: {}

@@ -1,0 +1,580 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  SMUS bootstrap — provisioning IAM, manage-access IAM, Tooling KMS+S3,
+  and 17 EnvironmentBlueprintConfigurations matching the official
+  aws/Unified-Studio-for-Amazon-Sagemaker enable_all_blueprints.yaml.
+
+# Composition:
+#   * IAM section is from aws-samples/sample-automate-sagemaker-unified-studio-using-iac
+#     (provisioning role, manage-access role, Tooling S3 + KMS).
+#   * Blueprint section is verbatim-equivalent to
+#     aws/Unified-Studio-for-Amazon-Sagemaker/main/cloudformation/domain/enable_all_blueprints.yaml
+#     (17 blueprints, with the same dependency chain so AWS doesn't
+#     stampede the DataZone control plane).
+#
+# We keep the 17 blueprints in a fixed dependency order (LakehouseCatalog
+# is the head of one chain; RedshiftServerless and QuickSight are
+# heads of two short side chains) because creating all 17 at once
+# triggers throttling in the DataZone control plane.
+
+Parameters:
+  pSUSDomainManagedAccessRoleName:
+    Type: String
+
+  pSUSDomainid:
+    Type: String
+
+  pSUSDomainExecutionRoleArn:
+    Type: String
+
+  pSUSToolingBPSubnets:
+    Type: String
+    Description: Comma-delimited subnet IDs (passed to every regional-parameters block).
+
+  pSUSToolingBPVpcId:
+    Type: String
+
+  pSUSBPToolingBucketName:
+    Type: String
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # IAM: provisioning role assumed by DataZone to provision project resources.
+  # ---------------------------------------------------------------------------
+  rSUSDomainProvisioningRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Additional permissions for SUS Domain provisioning
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AdditionalProvisioningPermission
+            Effect: Allow
+            Action:
+              - sagemaker:ListTags
+            Resource:
+              - !Sub 'arn:aws:datazone:${AWS::Region}:${AWS::AccountId}:domain/*'
+
+  rSUSDomainProvisioningRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Role used by SUS Domain to provision resources.
+      RoleName: !Sub AmazonSageMakerProvisioningRole-${AWS::AccountId}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: datazone.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/SageMakerStudioProjectProvisioningRolePolicy
+        - !Ref rSUSDomainProvisioningRolePolicy
+
+  rSUSDomainManagedAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: Grants SMUS permissions to publish, grant, and revoke access to Lakehouse, Glue, and Redshift data.
+      RoleName: !Ref pSUSDomainManagedAccessRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: datazone.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:aws:datazone:${AWS::Region}:${AWS::AccountId}:domain/${pSUSDomainid}'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonDataZoneGlueManageAccessRolePolicy
+        - arn:aws:iam::aws:policy/service-role/AmazonDataZoneRedshiftManageAccessRolePolicy
+        - arn:aws:iam::aws:policy/AmazonDataZoneSageMakerManageAccessRolePolicy
+
+  # ---------------------------------------------------------------------------
+  # KMS + S3 bucket consumed by every blueprint as the Tooling S3Location.
+  # ---------------------------------------------------------------------------
+  rSUSBPToolingKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SUS Tooling Blueprint encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: SUS-TOOLING-BP
+        Statement:
+          - Sid: 'Enable IAM User Permissions'
+            Effect: 'Allow'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: 'AllowKmsPermissionsForCloudWatch'
+            Effect: 'Allow'
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt*'
+              - 'kms:Decrypt*'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:datazone-*'
+          - Sid: 'RedshiftCreateGrantKmsPermissions'
+            Effect: 'Allow'
+            Principal:
+              AWS: !GetAtt rSUSDomainProvisioningRole.Arn
+            Action: 'kms:CreateGrant'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:ResourceAccount: !Ref 'AWS::AccountId'
+              StringLike:
+                kms:ViaService:
+                  - 'redshift-serverless.*.amazonaws.com'
+          - Sid: 'AthenaKmsPermissions'
+            Effect: 'Allow'
+            Principal:
+              AWS: !GetAtt rSUSDomainProvisioningRole.Arn
+            Action: 'kms:GenerateDataKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:CalledViaLast: 'athena.amazonaws.com'
+                aws:ResourceAccount: !Ref 'AWS::AccountId'
+          - Sid: 'EmrServerlessKmsPermissions'
+            Effect: 'Allow'
+            Principal:
+              Service: 'emr-serverless.amazonaws.com'
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:emr-serverless:${AWS::Region}:${AWS::AccountId}:/applications/*'
+          - Sid: 'EmrServerlessKmsPermissionsForProvisioning'
+            Effect: 'Allow'
+            Principal:
+              AWS: !GetAtt rSUSDomainProvisioningRole.Arn
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+          - Sid: 'AllowKmsKeyUsageForSageMakerDomain'
+            Effect: 'Allow'
+            Principal:
+              Service: 'datazone.amazonaws.com'
+              AWS: !Ref pSUSDomainExecutionRoleArn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: '*'
+          - Sid: 'AllowSageMakerDomainKmsGrantPermissions'
+            Effect: 'Allow'
+            Principal:
+              Service: 'datazone.amazonaws.com'
+              AWS: !Ref pSUSDomainExecutionRoleArn
+            Action:
+              - 'kms:ListGrants'
+              - 'kms:RevokeGrant'
+            Resource: '*'
+      EnableKeyRotation: true
+
+  rSUSBPToolingKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-SUSBPToolingKey
+      TargetKeyId: !Ref rSUSBPToolingKMSKey
+
+  rSUSBPToolingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref pSUSBPToolingBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt rSUSBPToolingKMSKey.Arn
+
+  rSUSBPToolingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref rSUSBPToolingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: 'SecureTransport'
+            Effect: 'Deny'
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${rSUSBPToolingBucket.Arn}/*'
+              - !GetAtt rSUSBPToolingBucket.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ---------------------------------------------------------------------------
+  # 17 EnvironmentBlueprintConfigurations.
+  #
+  # Mirrors aws/Unified-Studio-for-Amazon-Sagemaker
+  # /main/cloudformation/domain/enable_all_blueprints.yaml (canonical
+  # All-capabilities surface).
+  #
+  # `S3Location` is the s3:// URI form (matches the canonical template).
+  # Subnets/VpcId come from the seed VPC.
+  # ---------------------------------------------------------------------------
+  LakehouseCatalog:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'LakehouseCatalog'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters: {}
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  AmazonBedrockGuardrail:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: LakehouseCatalog
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'AmazonBedrockGuardrail'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  MLExperiments:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: AmazonBedrockGuardrail
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'MLExperiments'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  Tooling:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: MLExperiments
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'Tooling'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  RedshiftServerless:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'RedshiftServerless'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  EmrServerless:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: RedshiftServerless
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'EmrServerless'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  Workflows:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: EmrServerless
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'Workflows'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  AmazonBedrockPrompt:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: Workflows
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'AmazonBedrockPrompt'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  DataLake:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: AmazonBedrockPrompt
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'DataLake'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  AmazonBedrockEvaluation:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: DataLake
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'AmazonBedrockEvaluation'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  AmazonBedrockKnowledgeBase:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: AmazonBedrockEvaluation
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'AmazonBedrockKnowledgeBase'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  PartnerApps:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: AmazonBedrockKnowledgeBase
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'PartnerApps'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  AmazonBedrockChatAgent:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: PartnerApps
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'AmazonBedrockChatAgent'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  AmazonBedrockFunction:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: AmazonBedrockChatAgent
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'AmazonBedrockFunction'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  QuickSight:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'QuickSight'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  AmazonBedrockFlow:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: AmazonBedrockFunction
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'AmazonBedrockFlow'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+  EmrOnEc2:
+    Type: AWS::DataZone::EnvironmentBlueprintConfiguration
+    DependsOn: AmazonBedrockFlow
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      EnvironmentBlueprintIdentifier: 'EmrOnEc2'
+      ManageAccessRoleArn: !GetAtt rSUSDomainManagedAccessRole.Arn
+      ProvisioningRoleArn: !GetAtt rSUSDomainProvisioningRole.Arn
+      RegionalParameters:
+        - Region: !Ref 'AWS::Region'
+          Parameters:
+            S3Location: !Sub 's3://${rSUSBPToolingBucket}'
+            Subnets: !Ref pSUSToolingBPSubnets
+            VpcId: !Ref pSUSToolingBPVpcId
+      EnabledRegions:
+        - !Ref 'AWS::Region'
+
+Outputs:
+  oSUSDomainProvisioningRole:
+    Description: SUS Domain provisioning role ARN
+    Value: !GetAtt rSUSDomainProvisioningRole.Arn
+
+  oSUSDomainManagedAccessRole:
+    Description: SUS Domain manage-access role ARN
+    Value: !GetAtt rSUSDomainManagedAccessRole.Arn
+
+  oSUSBPToolingBucketName:
+    Description: Tooling blueprint S3 bucket name
+    Value: !Ref rSUSBPToolingBucket
+
+  oSUSBPToolingKMSKeyArn:
+    Description: Tooling blueprint KMS key ARN
+    Value: !GetAtt rSUSBPToolingKMSKey.Arn
+
+  LakehouseCatalogId:
+    Value: !GetAtt LakehouseCatalog.EnvironmentBlueprintId
+  AmazonBedrockGuardrailId:
+    Value: !GetAtt AmazonBedrockGuardrail.EnvironmentBlueprintId
+  MLExperimentsId:
+    Value: !GetAtt MLExperiments.EnvironmentBlueprintId
+  ToolingId:
+    Value: !GetAtt Tooling.EnvironmentBlueprintId
+  RedshiftServerlessId:
+    Value: !GetAtt RedshiftServerless.EnvironmentBlueprintId
+  EmrServerlessId:
+    Value: !GetAtt EmrServerless.EnvironmentBlueprintId
+  WorkflowsId:
+    Value: !GetAtt Workflows.EnvironmentBlueprintId
+  AmazonBedrockPromptId:
+    Value: !GetAtt AmazonBedrockPrompt.EnvironmentBlueprintId
+  DataLakeId:
+    Value: !GetAtt DataLake.EnvironmentBlueprintId
+  AmazonBedrockEvaluationId:
+    Value: !GetAtt AmazonBedrockEvaluation.EnvironmentBlueprintId
+  AmazonBedrockKnowledgeBaseId:
+    Value: !GetAtt AmazonBedrockKnowledgeBase.EnvironmentBlueprintId
+  PartnerAppsId:
+    Value: !GetAtt PartnerApps.EnvironmentBlueprintId
+  AmazonBedrockChatAgentId:
+    Value: !GetAtt AmazonBedrockChatAgent.EnvironmentBlueprintId
+  AmazonBedrockFunctionId:
+    Value: !GetAtt AmazonBedrockFunction.EnvironmentBlueprintId
+  AmazonBedrockFlowId:
+    Value: !GetAtt AmazonBedrockFlow.EnvironmentBlueprintId
+  EmrOnEc2Id:
+    Value: !GetAtt EmrOnEc2.EnvironmentBlueprintId
+  QuickSightId:
+    Value: !GetAtt QuickSight.EnvironmentBlueprintId

@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "SMUS bootstrap — admin project + project memberships (SSO user as PROJECT_OWNER)"
+
+# Verbatim from aws-samples/sample-automate-sagemaker-unified-studio-using-iac
+# /main/child-stacks/sus-project-stack.yaml (MIT-0).
+#
+# Note: the upstream template uses the Tooling-only profile for the admin
+# project. We pass the All-capabilities profile id via the master stack
+# instead, so the admin project gets the full feature set on creation.
+
+Parameters:
+  pSUSDomainid:
+    Description: Domain for which blueprint needs to be enabled
+    Type: String
+  pToolingProjectProfileId:
+    Description: Project Profile id for which we need to create project
+    Type: String
+  pName:
+    Description: Name of the project
+    Type: String
+  pSUSAutomationRoleArn:
+    Description: SUS Automation Role ARN
+    Type: String
+  pSSOUserID:
+    Description: SSO User ID to be added as Project Owner
+    Type: String
+  pSUSProvisioningRoleArn:
+    Type: String
+    Description: ARN of the SUS Provisioning Role
+  pSUSManagedAccessRoleArn:
+    Type: String
+    Description: ARN of the SUS Managed Access Role
+
+Resources:
+  rAddDataLakeAdministratorToLakeFormation:
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !Ref pSUSManagedAccessRoleArn
+        - DataLakePrincipalIdentifier: !Ref pSUSProvisioningRoleArn
+
+  rProject:
+    Type: AWS::DataZone::Project
+    DependsOn: rAddDataLakeAdministratorToLakeFormation
+    Properties:
+      Description: "Admin SUS Project"
+      DomainIdentifier: !Ref pSUSDomainid
+      Name: !Ref pName
+      ProjectProfileId: !Ref pToolingProjectProfileId
+
+  rAddSSOUserToProjectMembership:
+    Type: AWS::DataZone::ProjectMembership
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      ProjectIdentifier: !GetAtt rProject.Id
+      Member:
+        UserIdentifier: !Ref pSSOUserID
+      Designation: "PROJECT_OWNER"
+
+  rAddSUSAutomationRoleToProjectMembership:
+    Type: AWS::DataZone::ProjectMembership
+    Properties:
+      DomainIdentifier: !Ref pSUSDomainid
+      ProjectIdentifier: !GetAtt rProject.Id
+      Member:
+        UserIdentifier: !Ref pSUSAutomationRoleArn
+      Designation: "PROJECT_OWNER"
+
+Outputs:
+  oAdminProjectId:
+    Description: Admin SUS Project ID
+    Value: !GetAtt rProject.Id
+  oAdminProjectName:
+    Description: Admin SUS Project Name
+    Value: !Ref pName

@@ -1,0 +1,21 @@
+{
+  "name": "smus-seed-rds-to-parquet",
+  "role": "arn:aws:iam::571600872292:role/smus-seed-glue-job-role",
+  "default_arguments": {
+    "--glue_connection_jdbc": "smus-seed-jdbc-conn",
+    "--enable-job-insights": "true",
+    "--data_bucket": "smus-seed-glue-data-571600872292-us-east-1",
+    "--rds_database": "seeddb",
+    "--customers_table": "smus_seed_customers_parquet",
+    "--job-language": "python",
+    "--catalog_db_curated": "smus-seed-db-curated",
+    "--products_table": "smus_seed_products_parquet"
+  },
+  "connection_references": [
+    {
+      "original": "smus-seed-jdbc-conn",
+      "smus_connection_name": null,
+      "smus_connection_id": null
+    }
+  ]
+}

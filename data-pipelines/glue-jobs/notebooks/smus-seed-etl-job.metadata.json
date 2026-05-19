@@ -1,0 +1,10 @@
+{
+  "name": "smus-seed-etl-job",
+  "role": "arn:aws:iam::571600872292:role/smus-seed-glue-job-role",
+  "default_arguments": {
+    "--data_bucket": "smus-seed-glue-data-571600872292-us-east-1",
+    "--enable-job-insights": "true",
+    "--job-language": "python"
+  },
+  "connection_references": []
+}

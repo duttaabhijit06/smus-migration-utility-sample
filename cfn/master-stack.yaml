@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Master template for the SMUS bootstrap. Composes five child stacks:
+  domain (V2 + IAM + KMS + IDC ownership), 17 blueprints + provisioning
+  IAM + tooling bucket, 4 project profiles (incl. All capabilities),
+  policy grants for blueprints + profiles, and an admin project owned
+  by the IDC user smus-admin.
+
+# Why a custom master rather than the upstream `create_domain.yaml`:
+#   * The upstream master assumes pre-existing IAM roles and references
+#     two extra cross-org sub-stacks (fetch_accounts, create_resource_share)
+#     that aren't relevant to a single-account migration test bed.
+#   * The upstream master leaves IDC ownership unwired — we need explicit
+#     UserProfile/GroupProfile/Owner records so smus-admin owns the
+#     RootDomainUnit and the admin project from creation.
+#   * MANUAL UserAssignment is required so we control which IDC users
+#     get a SMUS profile (rather than auto-creating one for every IDC
+#     user the application sees).
+
+Parameters:
+  ChildStacksBucketName:
+    Type: String
+    Description: S3 bucket holding the 5 child templates (uploaded by migrate.sh).
+
+  pSUSDomainName:
+    Type: String
+    Default: smus-seed-domain
+
+  pSUSDomainExecutionRoleName:
+    Type: String
+    Default: smus-seed-domain-execution-role
+
+  pSUSDomainServiceRoleName:
+    Type: String
+    Default: smus-seed-domain-service-role
+
+  pSUSAutomationRoleName:
+    Type: String
+    Default: smus-seed-automation-role
+
+  pSUSDomainAutomationRolePolicyName:
+    Type: String
+    Default: smus-seed-automation-policy
+
+  pSUSDomainManagedAccessRoleName:
+    Type: String
+    Default: smus-seed-managed-access-role
+
+  pSUSToolingBPVpcId:
+    Type: String
+    Description: Seed VPC ID — used for blueprint regional parameters.
+
+  pSUSToolingBPSubnets:
+    Type: String
+    Description: Comma-delimited private subnet IDs for blueprint regional parameters.
+
+  pSUSBPToolingBucketName:
+    Type: String
+    Description: S3 bucket name created by the blueprint stack for Tooling.
+
+  pSSOUserID:
+    Type: String
+    Description: IDC user ID (smus-admin) — assigned as project owner + domain unit owner.
+
+  pSSOGroupID:
+    Type: String
+    Description: IDC group ID (smus-admins) — assigned as domain unit owner.
+
+  pSSOInstanceArn:
+    Type: String
+    Description: IDC instance ARN — pins the domain's SingleSignOn to the account-local instance.
+
+  pAdminProjectName:
+    Type: String
+    Default: smus-admin
+
+Resources:
+  DomainStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${ChildStacksBucketName}.s3.amazonaws.com/sus-domain-stack.yaml
+      Parameters:
+        pSUSDomainExecutionRoleName: !Ref pSUSDomainExecutionRoleName
+        pSUSDomainServiceRoleName: !Ref pSUSDomainServiceRoleName
+        pSUSAutomationRoleName: !Ref pSUSAutomationRoleName
+        pSUSDomainName: !Ref pSUSDomainName
+        pSUSDomainAutomationRolePolicyName: !Ref pSUSDomainAutomationRolePolicyName
+        pSSOGroupID: !Ref pSSOGroupID
+        pSSOUserID: !Ref pSSOUserID
+        pSSOInstanceArn: !Ref pSSOInstanceArn
+
+  BlueprintStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: DomainStack
+    Properties:
+      TemplateURL: !Sub https://${ChildStacksBucketName}.s3.amazonaws.com/sus-blueprints-stack.yaml
+      Parameters:
+        pSUSBPToolingBucketName: !Ref pSUSBPToolingBucketName
+        pSUSDomainManagedAccessRoleName: !Ref pSUSDomainManagedAccessRoleName
+        pSUSDomainid: !GetAtt DomainStack.Outputs.oSUSDomainID
+        pSUSDomainExecutionRoleArn: !GetAtt DomainStack.Outputs.oSUSDomainExecutionRoleArn
+        pSUSToolingBPSubnets: !Ref pSUSToolingBPSubnets
+        pSUSToolingBPVpcId: !Ref pSUSToolingBPVpcId
+
+  ProjectProfileStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: BlueprintStack
+    Properties:
+      TemplateURL: !Sub https://${ChildStacksBucketName}.s3.amazonaws.com/sus-project-profiles-stack.yaml
+      Parameters:
+        DomainId: !GetAtt DomainStack.Outputs.oSUSDomainID
+        DomainUnitId: !GetAtt DomainStack.Outputs.oSUSrootDomainUnitID
+        AccountId: !Ref AWS::AccountId
+        Region: !Ref AWS::Region
+        LakehouseCatalogId: !GetAtt BlueprintStack.Outputs.LakehouseCatalogId
+        AmazonBedrockGuardrailId: !GetAtt BlueprintStack.Outputs.AmazonBedrockGuardrailId
+        MLExperimentsId: !GetAtt BlueprintStack.Outputs.MLExperimentsId
+        ToolingId: !GetAtt BlueprintStack.Outputs.ToolingId
+        RedshiftServerlessId: !GetAtt BlueprintStack.Outputs.RedshiftServerlessId
+        EmrServerlessId: !GetAtt BlueprintStack.Outputs.EmrServerlessId
+        WorkflowsId: !GetAtt BlueprintStack.Outputs.WorkflowsId
+        AmazonBedrockPromptId: !GetAtt BlueprintStack.Outputs.AmazonBedrockPromptId
+        DataLakeId: !GetAtt BlueprintStack.Outputs.DataLakeId
+        AmazonBedrockEvaluationId: !GetAtt BlueprintStack.Outputs.AmazonBedrockEvaluationId
+        AmazonBedrockKnowledgeBaseId: !GetAtt BlueprintStack.Outputs.AmazonBedrockKnowledgeBaseId
+        PartnerAppsId: !GetAtt BlueprintStack.Outputs.PartnerAppsId
+        AmazonBedrockChatAgentId: !GetAtt BlueprintStack.Outputs.AmazonBedrockChatAgentId
+        AmazonBedrockFunctionId: !GetAtt BlueprintStack.Outputs.AmazonBedrockFunctionId
+        AmazonBedrockFlowId: !GetAtt BlueprintStack.Outputs.AmazonBedrockFlowId
+        EmrOnEc2Id: !GetAtt BlueprintStack.Outputs.EmrOnEc2Id
+        QuickSightId: !GetAtt BlueprintStack.Outputs.QuickSightId
+
+  PolicyGrantStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: ProjectProfileStack
+    Properties:
+      TemplateURL: !Sub https://${ChildStacksBucketName}.s3.amazonaws.com/sus-policy-grant-stack.yaml
+      Parameters:
+        DomainId: !GetAtt DomainStack.Outputs.oSUSDomainID
+        DomainUnitId: !GetAtt DomainStack.Outputs.oSUSrootDomainUnitID
+        AccountId: !Ref AWS::AccountId
+        LakehouseCatalogId: !GetAtt BlueprintStack.Outputs.LakehouseCatalogId
+        AmazonBedrockGuardrailId: !GetAtt BlueprintStack.Outputs.AmazonBedrockGuardrailId
+        MLExperimentsId: !GetAtt BlueprintStack.Outputs.MLExperimentsId
+        ToolingId: !GetAtt BlueprintStack.Outputs.ToolingId
+        RedshiftServerlessId: !GetAtt BlueprintStack.Outputs.RedshiftServerlessId
+        EmrServerlessId: !GetAtt BlueprintStack.Outputs.EmrServerlessId
+        WorkflowsId: !GetAtt BlueprintStack.Outputs.WorkflowsId
+        AmazonBedrockPromptId: !GetAtt BlueprintStack.Outputs.AmazonBedrockPromptId
+        DataLakeId: !GetAtt BlueprintStack.Outputs.DataLakeId
+        AmazonBedrockEvaluationId: !GetAtt BlueprintStack.Outputs.AmazonBedrockEvaluationId
+        AmazonBedrockKnowledgeBaseId: !GetAtt BlueprintStack.Outputs.AmazonBedrockKnowledgeBaseId
+        PartnerAppsId: !GetAtt BlueprintStack.Outputs.PartnerAppsId
+        AmazonBedrockChatAgentId: !GetAtt BlueprintStack.Outputs.AmazonBedrockChatAgentId
+        AmazonBedrockFunctionId: !GetAtt BlueprintStack.Outputs.AmazonBedrockFunctionId
+        AmazonBedrockFlowId: !GetAtt BlueprintStack.Outputs.AmazonBedrockFlowId
+        EmrOnEc2Id: !GetAtt BlueprintStack.Outputs.EmrOnEc2Id
+        QuickSightId: !GetAtt BlueprintStack.Outputs.QuickSightId
+        SQLAnalyticsProfileId: !GetAtt ProjectProfileStack.Outputs.SQLAnalyticsProfileId
+        AllCapabilitiesProjectProfileId: !GetAtt ProjectProfileStack.Outputs.AllCapabilitiesProjectProfileId
+        GenerativeAIApplicationDevelopmentProfileId: !GetAtt ProjectProfileStack.Outputs.GenerativeAIApplicationDevelopmentProfileId
+
+  ProjectStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: PolicyGrantStack
+    Properties:
+      TemplateURL: !Sub https://${ChildStacksBucketName}.s3.amazonaws.com/sus-project-stack.yaml
+      Parameters:
+        pSUSDomainid: !GetAtt DomainStack.Outputs.oSUSDomainID
+        pToolingProjectProfileId: !GetAtt ProjectProfileStack.Outputs.AllCapabilitiesProjectProfileId
+        pName: !Ref pAdminProjectName
+        pSUSAutomationRoleArn: !GetAtt DomainStack.Outputs.oSUSAutomationRoleArn
+        pSSOUserID: !Ref pSSOUserID
+        pSUSProvisioningRoleArn: !GetAtt BlueprintStack.Outputs.oSUSDomainProvisioningRole
+        pSUSManagedAccessRoleArn: !GetAtt BlueprintStack.Outputs.oSUSDomainManagedAccessRole
+
+Outputs:
+  oSUSDomainID:
+    Description: Domain ID (V2)
+    Value: !GetAtt DomainStack.Outputs.oSUSDomainID
+
+  oSUSrootDomainUnitID:
+    Description: Root domain unit ID
+    Value: !GetAtt DomainStack.Outputs.oSUSrootDomainUnitID
+
+  oSUSDomainExecutionRoleArn:
+    Value: !GetAtt DomainStack.Outputs.oSUSDomainExecutionRoleArn
+
+  oSUSDomainServiceRoleArn:
+    Value: !GetAtt DomainStack.Outputs.oSUSDomainServiceRoleArn
+
+  oAllCapabilitiesProjectProfileId:
+    Description: 'All capabilities project profile ID — used by the migration tool'
+    Value: !GetAtt ProjectProfileStack.Outputs.AllCapabilitiesProjectProfileId
+
+  oAdminProjectId:
+    Description: 'Admin SUS project ID — owned by smus-admin (IDC SSO)'
+    Value: !GetAtt ProjectStack.Outputs.oAdminProjectId
+
+  oAdminProjectName:
+    Value: !GetAtt ProjectStack.Outputs.oAdminProjectName

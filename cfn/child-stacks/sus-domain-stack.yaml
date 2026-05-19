@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "SMUS bootstrap — domain stack (KMS key, IAM roles, Domain, IDC user/group profiles, owners)"
+
+# Verbatim from aws-samples/sample-automate-sagemaker-unified-studio-using-iac/main/child-stacks/sus-domain-stack.yaml (MIT-0).
+# We intentionally do not modify this — it's the canonical reference for
+# how to bootstrap a V2 SMUS domain with proper SSO ownership.
+
+Parameters:
+  pSUSDomainExecutionRoleName:
+    Type: String
+    Description: Name of the SUS Domain execution role
+  pSUSDomainServiceRoleName:
+    Type: String
+    Description: Name of the SUS Domain service role
+  pSUSAutomationRoleName:
+    Type: String
+    Description: IAM Role used by Lambda execution role for custom resources
+  pSUSDomainName:
+    Type: String
+    Description: Name of the SUS Domain
+  pSUSDomainAutomationRolePolicyName:
+    Type: String
+    Description: Name of Automation role policy
+  pSSOUserID:
+    Type: String
+    Description: SSO User ID to be added as Project Owner
+  pSSOGroupID:
+    Type: String
+    Description: SSO Group ID to be added as Domain Unit Owner
+  pSSOInstanceArn:
+    Type: String
+    Description: IDC instance ARN — pins the domain's SingleSignOn to the account-local instance so DataZone resolves user/group IDs against the right identity store.
+
+Resources:
+  rSUSDomainKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for SUS domain encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: SUS-DOMAIN
+        Statement:
+          - Sid: 'Enable IAM User Permissions'
+            Effect: 'Allow'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: "AllowDatazoneRoles"
+            Effect: "Allow"
+            Principal:
+              AWS: "*"
+            Action:
+              - "kms:Decrypt"
+              - "kms:GenerateDataKey"
+            Resource: "*"
+            Condition:
+              StringLike:
+                aws:PrincipalArn:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/datazone_*"
+      EnableKeyRotation: true
+
+  rSUSDomainKMSKeyAlias:
+    Type: 'AWS::KMS::Alias'
+    DeletionPolicy: Retain
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}-SUSKey
+      TargetKeyId: !Ref rSUSDomainKMSKey
+
+  rSUSAutomationRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Permissions for SUS Domain automation Lambda function
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DomainCreation
+            Effect: Allow
+            Action:
+              - datazone:CreateDomain
+              - datazone:UpdateDomain
+              - datazone:TagResource
+              - datazone:GetDomain
+              - datazone:GetDomainUnit
+            Resource:
+              - !Sub 'arn:aws:datazone:${AWS::Region}:${AWS::AccountId}:domain/*'
+          - Sid: domainkey
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource:
+              - !GetAtt rSUSDomainKMSKey.Arn
+          - Sid: IAM
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !GetAtt rSUSDomainExecutionRole.Arn
+              - !GetAtt rSUSDomainServiceRole.Arn
+          - Sid: sso
+            Effect: Allow
+            Action:
+              - sso:ListInstances
+              - sso:CreateApplication
+              - sso:PutApplicationAssignmentConfiguration
+              - sso:PutApplicationGrant
+              - sso:PutApplicationAuthenticationMethod
+              - sso:PutApplicationAccessScope
+            Resource:
+              - 'arn:aws:sso:::instance/*'
+              - 'arn:aws:sso::aws:applicationProvider/*'
+              - 'arn:aws:sso::*:application/*/*'
+          - Sid: IAMRoleAccess
+            Effect: Allow
+            Action:
+              - iam:GetRole
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/*
+
+  rSUSAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM Role assumed by custom resource Lambda function
+      RoleName: !Ref pSUSAutomationRoleName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref rSUSAutomationRolePolicy
+
+  rSUSDomainExecutionRoleKMSPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: KMS access permissions for SUS Domain execution role
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: domainkey
+            Effect: Allow
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:GenerateDataKey'
+            Resource: !GetAtt rSUSDomainKMSKey.Arn
+
+  rSUSDomainExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM Role assumed by SageMaker Domain to call APIs to Amazon SageMaker Unified Studio.
+      RoleName: !Ref pSUSDomainExecutionRoleName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: datazone.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+              - sts:SetContext
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+              ForAllValues:StringLike:
+                aws:TagKeys:
+                  - 'datazone*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/SageMakerStudioDomainExecutionRolePolicy
+        - !Ref rSUSDomainExecutionRoleKMSPolicy
+
+  rSUSDomainServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: IAM Role assumed by SageMaker Domain to perform domain level actions.
+      RoleName: !Ref pSUSDomainServiceRoleName
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: datazone.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/SageMakerStudioDomainServiceRolePolicy
+
+  rSUSDomain:
+    Type: AWS::DataZone::Domain
+    Properties:
+      Name: !Ref pSUSDomainName
+      Description: "The SUS domain (V2)"
+      DomainExecutionRole: !GetAtt rSUSDomainExecutionRole.Arn
+      DomainVersion: "V2"
+      KmsKeyIdentifier: !GetAtt rSUSDomainKMSKey.Arn
+      ServiceRole: !GetAtt rSUSDomainServiceRole.Arn
+      SingleSignOn: {
+        Type: "IAM_IDC",
+        UserAssignment: "MANUAL",
+        IdcInstanceArn: !Ref pSSOInstanceArn
+      }
+
+  rSUSAutomationRoleProfile:
+    Type: AWS::DataZone::UserProfile
+    Properties:
+      DomainIdentifier: !Ref rSUSDomain
+      UserIdentifier: !GetAtt rSUSAutomationRole.Arn
+      UserType: IAM_ROLE
+      Status: ASSIGNED
+
+  rSSOUserProfile:
+    Type: AWS::DataZone::UserProfile
+    DependsOn: rSUSDomain
+    Properties:
+      DomainIdentifier: !Ref rSUSDomain
+      UserIdentifier: !Ref pSSOUserID
+      UserType: SSO_USER
+      Status: ASSIGNED
+
+  rSUSDomainOwnerSSOUser:
+    Type: AWS::DataZone::Owner
+    DependsOn:
+      - rSSOUserProfile
+      - rSUSDomain
+    Properties:
+      DomainIdentifier: !Ref rSUSDomain
+      EntityIdentifier: !GetAtt rSUSDomain.RootDomainUnitId
+      EntityType: DOMAIN_UNIT
+      Owner:
+        User:
+          UserIdentifier: !Ref pSSOUserID
+
+  rSUSDomainOwnerIAMRole:
+    Type: AWS::DataZone::Owner
+    DependsOn: rSUSAutomationRoleProfile
+    Properties:
+      DomainIdentifier: !Ref rSUSDomain
+      EntityIdentifier: !GetAtt rSUSDomain.RootDomainUnitId
+      EntityType: DOMAIN_UNIT
+      Owner:
+        User:
+          UserIdentifier: !GetAtt rSUSAutomationRole.Arn
+
+  rSUSGroupProfile:
+    Type: AWS::DataZone::GroupProfile
+    Properties:
+      DomainIdentifier: !Ref rSUSDomain
+      GroupIdentifier: !Ref pSSOGroupID
+      Status: ASSIGNED
+
+  rSUSDomainOwnerSSOGroup:
+    Type: AWS::DataZone::Owner
+    DependsOn: rSUSGroupProfile
+    Properties:
+      DomainIdentifier: !Ref rSUSDomain
+      EntityIdentifier: !GetAtt rSUSDomain.RootDomainUnitId
+      EntityType: DOMAIN_UNIT
+      Owner:
+        Group:
+          GroupIdentifier: !Ref pSSOGroupID
+
+Outputs:
+  oSUSDomainID:
+    Description: Domain ID for cross stack references
+    Value: !Ref rSUSDomain
+  oSUSrootDomainUnitID:
+    Description: Root Domain Unit ID for cross stack references
+    Value: !GetAtt rSUSDomain.RootDomainUnitId
+  oSUSDomainKMSKeyArn:
+    Description: Domain KMS Key ARN for cross stack references
+    Value: !GetAtt rSUSDomainKMSKey.Arn
+  oSUSDomainExecutionRoleArn:
+    Description: ARN of the IAM Role assumed by SageMaker Domain to call APIs.
+    Value: !GetAtt rSUSDomainExecutionRole.Arn
+  oSUSDomainServiceRoleArn:
+    Description: ARN of the IAM Role assumed by SageMaker Domain for domain level actions.
+    Value: !GetAtt rSUSDomainServiceRole.Arn
+  oSUSDomainName:
+    Description: Name of the SUS Domain
+    Value: !Ref pSUSDomainName
+  oSUSAutomationRoleArn:
+    Description: ARN of the IAM Role assumed by the SUS Automation Lambda Function.
+    Value: !GetAtt rSUSAutomationRole.Arn
+  oSUSAutomationRoleName:
+    Description: Name of the SUS Automation Role.
+    Value: !Ref pSUSAutomationRoleName

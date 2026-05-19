@@ -1,0 +1,16 @@
+[
+    {"ParameterKey": "ChildStacksBucketName",          "ParameterValue": "smus-seed-cfn-{{account}}-{{region}}"},
+    {"ParameterKey": "pSUSDomainName",                  "ParameterValue": "smus-seed-domain"},
+    {"ParameterKey": "pSUSDomainExecutionRoleName",     "ParameterValue": "smus-seed-domain-execution-role"},
+    {"ParameterKey": "pSUSDomainServiceRoleName",       "ParameterValue": "smus-seed-domain-service-role"},
+    {"ParameterKey": "pSUSAutomationRoleName",          "ParameterValue": "smus-seed-automation-role"},
+    {"ParameterKey": "pSUSDomainAutomationRolePolicyName", "ParameterValue": "smus-seed-automation-policy"},
+    {"ParameterKey": "pSUSDomainManagedAccessRoleName", "ParameterValue": "smus-seed-managed-access-role"},
+    {"ParameterKey": "pSUSToolingBPVpcId",              "ParameterValue": "{{vpc_id}}"},
+    {"ParameterKey": "pSUSToolingBPSubnets",            "ParameterValue": "{{subnet_ids}}"},
+    {"ParameterKey": "pSUSBPToolingBucketName",         "ParameterValue": "amazon-datazone-tooling-{{account}}-{{region}}"},
+    {"ParameterKey": "pSSOUserID",                      "ParameterValue": "{{sso_user_id}}"},
+    {"ParameterKey": "pSSOGroupID",                     "ParameterValue": "{{sso_group_id}}"},
+    {"ParameterKey": "pSSOInstanceArn",                 "ParameterValue": "{{sso_instance_arn}}"},
+    {"ParameterKey": "pAdminProjectName",               "ParameterValue": "smus-admin"}
+]
