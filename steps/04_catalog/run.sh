@@ -91,7 +91,19 @@ if [ -z "$DBS_JSON" ]; then
     DBS_JSON='{"DatabaseList":[]}'
 fi
 
-DB_NAMES_JSON="$(printf '%s\n' "$DBS_JSON" | jq -c '[.DatabaseList[]?.Name | select(. != null)]')"
+# Filter out databases that should NEVER be added to the SMUS data
+# source's `relationalFilterConfigurations`:
+#   * `default` — the Glue system database; usually empty and adds noise.
+#   * `glue_db_*` — DataZone-managed project consumption-side databases.
+#     These hold resource links to assets subscribed FROM elsewhere.
+#     Adding them back to a SMUS data source would be a circular
+#     publish-into-self loop. Includes both this domain's own
+#     glue_db_<envId> and stragglers from torn-down domains.
+DB_NAMES_JSON="$(printf '%s\n' "$DBS_JSON" | jq -c \
+    '[.DatabaseList[]?.Name
+        | select(. != null)
+        | select(. != "default")
+        | select(startswith("glue_db_") | not)]')"
 DB_NAMES_LIST="$(printf '%s\n' "$DB_NAMES_JSON" | jq -r '.[]?')"
 
 DB_ENTRIES='[]'
@@ -184,7 +196,30 @@ SCHEDULE_JSON='{"schedule":"cron(0 0 * * ? *)"}'
 LAKEHOUSE_CONN_ID="${MT_LAKEHOUSE_CONNECTION_ID:-}"
 
 if [ -n "$DATA_SOURCE_ID" ]; then
-    mt_log "data source '$DATA_SOURCE_NAME' already exists (id=$DATA_SOURCE_ID); skipping create"
+    # Data source already exists. Reconcile its configuration with
+    # the current `relationalFilterConfigurations` we just built —
+    # this catches the case where a previous run included databases
+    # that should now be filtered out (e.g. `default` and `glue_db_*`
+    # which we used to enumerate before this filter was added). On
+    # a healthy re-run with no DB list change, this is a no-op as
+    # far as the SMUS portal is concerned.
+    if mt_apply_mode; then
+        UPDATE_OUT="$(_aws_capture datazone update-data-source \
+            --domain-identifier "$MT_SMUS_DOMAIN_ID" \
+            --identifier "$DATA_SOURCE_ID" \
+            --configuration "$CONFIG_JSON" \
+            --schedule "$SCHEDULE_JSON" 2>&1 || true)"
+        # update-data-source returns the same JSON shape as create;
+        # we don't need anything from it. Failure is logged but not
+        # fatal — operator can retry; no resource is created/destroyed.
+        if printf '%s\n' "$UPDATE_OUT" | grep -qE '^STATUS: error|^An error occurred'; then
+            mt_log "WARN: update-data-source returned non-zero; check stack events"
+        else
+            mt_log "data source '$DATA_SOURCE_NAME' (id=$DATA_SOURCE_ID) configuration reconciled"
+        fi
+    else
+        mt_log "data source '$DATA_SOURCE_NAME' already exists (id=$DATA_SOURCE_ID); would reconcile config in --apply"
+    fi
 elif [ -z "$LAKEHOUSE_CONN_ID" ] && mt_apply_mode; then
     mt_status error "create-data-source needs MT_LAKEHOUSE_CONNECTION_ID; run Step 1 again after the All-capabilities profile finishes provisioning"
     exit 1

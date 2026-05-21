@@ -96,7 +96,7 @@ You can tweak every CloudFormation parameter — see the next section.
 
 ## CloudFormation parameter inputs
 
-There are 20 inputs to the CloudFormation stack. **Every one is overridable.** The script resolves each through this priority chain:
+There are 21 inputs to the CloudFormation stack. **Every one is overridable.** The script resolves each through this priority chain:
 
 ```
 CLI flag  >  environment variable  >  config/smus-setup.config.json  >  auto-discovered  >  hard-coded default
@@ -128,6 +128,7 @@ Three workflows:
 | **Automation Lambda IAM role name** | `--automation-role-name NAME` | `SMUS_AUTOMATION_ROLE_NAME` | `smus-seed-automation-role` |
 | **Automation policy name** | `--automation-role-policy-name NAME` | `SMUS_AUTOMATION_ROLE_POLICY_NAME` | `smus-seed-automation-policy` |
 | **Manage-access IAM role name** | `--managed-access-role-name NAME` | `SMUS_MANAGED_ACCESS_ROLE_NAME` | `sagemaker-studio-manage-access-role` |
+| **CFN stack name** | `--stack-name NAME` | `SMUS_STACK_NAME` | `smus-seed`. Override to namespace stacks in your account (e.g. `acme-platform-smus`); persisted to `config/smus-setup.config.json` so subsequent setup / teardown runs reuse the same name. |
 | **Git provider** | `--repo-provider PROV` | `SMUS_REPO_PROVIDER` | `CodeCommit` (alternatives: `GitHub`, `GitLab`, `Bitbucket`) |
 | **Git repo / connection name** | `--repo-name NAME` | `SMUS_REPO_NAME` | `<domain-name>-migration` |
 | **Git repo URL** (3P providers) | `--repo-url URL` | `SMUS_REPO_URL` | empty — required for 3P (e.g. `https://github.com/owner/repo.git`) |

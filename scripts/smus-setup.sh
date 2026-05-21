@@ -65,6 +65,7 @@
 #   --automation-role-name NAME        In-stack Lambda role      (default: smus-seed-automation-role)
 #   --automation-role-policy-name NAME Policy on automation role (default: smus-seed-automation-policy)
 #   --managed-access-role-name NAME    Manage-access IAM role    (default: sagemaker-studio-manage-access-role)
+#   --stack-name NAME                  Top-level CFN stack name  (default: smus-seed)
 #
 # Git repository / connection wiring (all optional):
 #   --repo-provider PROV               CodeCommit | GitHub | GitLab | Bitbucket  (default: CodeCommit)
@@ -111,6 +112,11 @@ CLI_DOMAIN_SERVICE_ROLE_NAME=""
 CLI_AUTOMATION_ROLE_NAME=""
 CLI_AUTOMATION_ROLE_POLICY_NAME=""
 CLI_MANAGED_ACCESS_ROLE_NAME=""
+# Top-level CFN stack name. Defaults to "smus-seed" for the seed
+# tutorial flow; customers running this against their own
+# infrastructure can override (e.g. "acme-platform-smus") to keep
+# stacks in their account namespaced.
+CLI_STACK_NAME=""
 # Git repository / connection wiring (managed at the domain level).
 # CodeCommit (default) creates an in-account repo via CFN; any 3P value
 # creates an AWS::CodeConnections::Connection that lands in PENDING and
@@ -120,7 +126,7 @@ CLI_REPO_NAME=""
 CLI_REPO_URL=""
 CLI_REPO_CONNECTION_ARN=""
 
-usage() { sed -n '2,78p' "$0"; exit 64; }
+usage() { sed -n '2,79p' "$0"; exit 64; }
 
 # -----------------------------------------------------------------------------
 # CLI parsing
@@ -197,6 +203,8 @@ while [ $# -gt 0 ]; do
         --automation-role-policy-name=*) CLI_AUTOMATION_ROLE_POLICY_NAME="${1#*=}"; shift ;;
         --managed-access-role-name)     CLI_MANAGED_ACCESS_ROLE_NAME="$2"; shift 2 ;;
         --managed-access-role-name=*)   CLI_MANAGED_ACCESS_ROLE_NAME="${1#*=}"; shift ;;
+        --stack-name)                   CLI_STACK_NAME="$2"; shift 2 ;;
+        --stack-name=*)                 CLI_STACK_NAME="${1#*=}"; shift ;;
         # ---- Git repository / connection wiring. ----
         --repo-provider)                CLI_REPO_PROVIDER="$2"; shift 2 ;;
         --repo-provider=*)              CLI_REPO_PROVIDER="${1#*=}"; shift ;;
@@ -713,9 +721,17 @@ _iam_purge_orphans() {
         fi
     done
 
-    # ----- S3 bucket: amazon-datazone-projects-<acct>-<region> -----
+    # ----- S3 bucket: amazon-datazone-projects-<acct>-<region>-<stack> -----
+    # The bucket name is now stack-suffixed (see sus-domain-stack.yaml).
+    # We derive the same name here so this pre-deploy hygiene step
+    # finds and cleans up the bucket from a previous run with the same
+    # stack name. We use the same 14-char suffix cap as `_cfn_bootstrap`
+    # so the names line up.
     if [ -n "$_account_id" ]; then
-        local _projects_bucket="amazon-datazone-projects-${_account_id}-${_region}"
+        local _stack_name_for_cleanup _stack_suffix_for_cleanup
+        _stack_name_for_cleanup="$(_resolve_stack_name)"
+        _stack_suffix_for_cleanup="$(printf '%s' "$_stack_name_for_cleanup" | cut -c1-14)"
+        local _projects_bucket="amazon-datazone-projects-${_account_id}-${_region}-${_stack_suffix_for_cleanup}"
         if aws s3api head-bucket --bucket "$_projects_bucket" --region "$_region" >/dev/null 2>&1; then
             local _bucket_cfn
             _bucket_cfn="$(aws s3api get-bucket-tagging --bucket "$_projects_bucket" \
@@ -743,15 +759,23 @@ _iam_purge_orphans() {
         fi
     fi
 
-    # ----- S3 bucket: amazon-datazone-tooling-<acct>-<region> -----
+    # ----- S3 bucket: amazon-datazone-tooling-<acct>-<region>-<stack> -----
     # CFN's BlueprintStack creates this with `DeletionPolicy: Retain`,
     # so it can survive past teardowns. On a fresh deploy CFN will hit
     # `BucketAlreadyOwnedByYou` if it exists. The standard teardown
     # already calls `_final_cleanup` which drains + deletes this
     # bucket, so this branch only triggers when an operator skipped
-    # teardown or `--keep-cfn` was used previously.
+    # teardown or `--keep-cfn` was used previously. Bucket name is
+    # stack-suffixed (see _cfn_bootstrap) so we compute it the same
+    # way here.
     if [ -n "$_account_id" ]; then
-        local _tooling_bucket="amazon-datazone-tooling-${_account_id}-${_region}"
+        local _stack_name_for_tooling _stack_suffix_for_tooling _tooling_bucket
+        _stack_name_for_tooling="$(_resolve_stack_name)"
+        _stack_suffix_for_tooling="$(printf '%s' "$_stack_name_for_tooling" | cut -c1-14)"
+        _tooling_bucket="$(_smus_setup_config_get tooling_bucket 2>/dev/null || true)"
+        if [ -z "$_tooling_bucket" ]; then
+            _tooling_bucket="amazon-datazone-tooling-${_account_id}-${_region}-${_stack_suffix_for_tooling}"
+        fi
         if aws s3api head-bucket --bucket "$_tooling_bucket" --region "$_region" >/dev/null 2>&1; then
             local _tb_cfn
             _tb_cfn="$(aws s3api get-bucket-tagging --bucket "$_tooling_bucket" \
@@ -889,6 +913,177 @@ _resolve_cfn_param() {
 
 
 # -----------------------------------------------------------------------------
+# _resolve_stack_name
+#
+# Resolves the top-level CFN stack name through the standard priority
+# chain (CLI > env > config > default). Used by `_cfn_bootstrap`,
+# `_action_teardown_via_lambda`, and the legacy
+# `_teardown_destroy_smus_stack` so a customer can override once via
+# `--stack-name acme-platform-smus` or `SMUS_STACK_NAME=...` and have
+# every subsequent invocation pick up the same name from
+# `config/smus-setup.config.json`.
+#
+# Default is `smus-seed` to preserve the seed tutorial flow's behavior.
+# -----------------------------------------------------------------------------
+_resolve_stack_name() {
+    _resolve_cfn_param stack_name \
+        "$CLI_STACK_NAME" "${SMUS_STACK_NAME:-}" "smus-seed"
+}
+
+
+# -----------------------------------------------------------------------------
+# _resolve_stack_derived_param <key> <cli_override> <env_override> <default>
+#
+# Variant of `_resolve_cfn_param` that SKIPS the persisted-config
+# tier. Used for parameters whose default is derived from the stack
+# name (e.g. `<stack-name>-automation-role`). Without this, a re-run
+# with a new --stack-name would still pick up the old stack's
+# persisted role names and try to create them inside the new stack,
+# which is exactly what we're trying to prevent. Operators who
+# explicitly set the value via CLI or env get their override
+# honored as usual.
+# -----------------------------------------------------------------------------
+_resolve_stack_derived_param() {
+    local _key="$1"
+    local _cli="$2"
+    local _env="$3"
+    local _default="$4"
+    if [ -n "$_cli" ]; then
+        printf '%s' "$_cli"
+        return 0
+    fi
+    if [ -n "$_env" ]; then
+        printf '%s' "$_env"
+        return 0
+    fi
+    # Skip config tier — always re-derive from current stack name.
+    printf '%s' "$_default"
+}
+
+
+# -----------------------------------------------------------------------------
+# _resolve_tooling_bucket
+#
+# Returns the canonical name of the SMUS tooling S3 bucket. Reads the
+# persisted `tooling_bucket` from smus-setup.config.json first
+# (populated by `_cfn_bootstrap` on deploy) and falls back to the
+# stack-suffixed default if absent. Used by every helper that needs
+# to head-bucket / drain / KMS-lookup the tooling bucket so the
+# answer is consistent between deploy time and any later helper.
+# -----------------------------------------------------------------------------
+_resolve_tooling_bucket() {
+    local _account="$1"
+    local _region="$2"
+    local _v
+    _v="$(_smus_setup_config_get tooling_bucket 2>/dev/null || true)"
+    if [ -n "$_v" ]; then
+        printf '%s' "$_v"
+        return 0
+    fi
+    local _stack _suffix
+    _stack="$(_resolve_stack_name)"
+    _suffix="$(printf '%s' "$_stack" | cut -c1-14)"
+    printf 'amazon-datazone-tooling-%s-%s-%s' "$_account" "$_region" "$_suffix"
+}
+
+
+# -----------------------------------------------------------------------------
+# _setup_auto_wipe_on_stack_change
+#
+# Detects when the operator passed a different `--stack-name` than the
+# one persisted from a previous deploy, and wipes every config key
+# whose value would otherwise leak from the old stack into the new
+# one. Keeps operator-pinned choices that aren't stack-specific
+# (group names, IDC instance ARN, VPC ID, subnet IDs).
+#
+# Also wipes migration-tool state in the same case — a new stack
+# means a new SMUS domain, which means the migration tool can't
+# meaningfully resume from a partial run against the old domain.
+#
+# Backups are kept at <path>.bak.<timestamp> so an operator can
+# recover if they ran with the wrong --stack-name flag by accident.
+#
+# Skipped on dry-run (no destructive action allowed).
+# -----------------------------------------------------------------------------
+_setup_auto_wipe_on_stack_change() {
+    if [ "$MODE_FLAG" != "--apply" ]; then
+        return 0
+    fi
+
+    local _setup_cfg="${ROOT_DIR}/config/smus-setup.config.json"
+    if [ ! -f "$_setup_cfg" ] || ! command -v jq >/dev/null 2>&1; then
+        # No prior config or no jq — nothing to compare against.
+        return 0
+    fi
+
+    local _persisted _resolved
+    _persisted="$(jq -r '.stack_name // empty' "$_setup_cfg" 2>/dev/null)"
+    _resolved="$(_resolve_stack_name)"
+
+    if [ -z "$_persisted" ] || [ "$_persisted" = "$_resolved" ]; then
+        # First deploy or same stack — nothing to wipe.
+        return 0
+    fi
+
+    echo "==> Auto-wipe: stack name change detected (was '${_persisted}', now '${_resolved}')"
+    echo "    Clearing stale stack-derived values from config + state files."
+
+    local _ts
+    _ts="$(date +%s)"
+
+    # Stack-derived keys that MUST NOT carry over between stacks.
+    # Group/IDC/VPC choices are operator-level and stay.
+    local _stale_keys=(
+        # Stack-derived names
+        domain_name admin_project_name
+        domain_execution_role_name domain_service_role_name
+        automation_role_name automation_role_policy_name
+        managed_access_role_name
+        templates_bucket tooling_bucket projects_bucket
+        # Stack-derived repo wiring
+        repo_name repo_url codecommit_repo_arn repo_connection_arn
+        # Discovered IDs from the previous deploy
+        smus_domain_id admin_project_id admin_project_profile_id
+        domain_service_role
+    )
+    local _filter='del('
+    local _i=0
+    for _k in "${_stale_keys[@]}"; do
+        if [ "$_i" -gt 0 ]; then _filter="${_filter}, "; fi
+        _filter="${_filter}.${_k}"
+        _i=$((_i + 1))
+    done
+    _filter="${_filter})"
+
+    # Backup + rewrite smus-setup.config.json with the stale keys removed.
+    local _backup="${_setup_cfg}.bak.${_ts}"
+    cp "$_setup_cfg" "$_backup"
+    if jq "$_filter" "$_setup_cfg" > "${_setup_cfg}.tmp" 2>/dev/null; then
+        mv "${_setup_cfg}.tmp" "$_setup_cfg"
+        echo "    + cleared stale keys from smus-setup.config.json (backup: ${_backup})"
+    else
+        rm -f "${_setup_cfg}.tmp"
+        echo "    WARN: failed to rewrite smus-setup.config.json; leaving as-is"
+    fi
+
+    # Migration-tool state + config: a new stack means a new domain,
+    # so any migration progress against the old domain is meaningless.
+    # Wipe both with backups.
+    local _mt_state="${ROOT_DIR}/state/migration.state.json"
+    local _mt_config="${ROOT_DIR}/config/migration.config.json"
+    if [ -f "$_mt_state" ]; then
+        mv "$_mt_state" "${_mt_state}.bak.${_ts}"
+        echo "    + wiped migration.state.json (backup: ${_mt_state}.bak.${_ts})"
+    fi
+    if [ -f "$_mt_config" ]; then
+        mv "$_mt_config" "${_mt_config}.bak.${_ts}"
+        echo "    + wiped migration.config.json (backup: ${_mt_config}.bak.${_ts})"
+    fi
+    echo
+}
+
+
+# -----------------------------------------------------------------------------
 # _surface_repo_info <outputs_json> <region>
 #
 # Reads repo / connection outputs from the master stack and:
@@ -1007,7 +1202,11 @@ _cfn_bootstrap() {
         _account="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")"
     fi
     local _region="${AWS_DEFAULT_REGION:-us-east-1}"
-    local _stack_name="smus-seed"
+    local _stack_name
+    _stack_name="$(_resolve_stack_name)"
+    # Persist immediately so a teardown invoked without flags reads
+    # the same stack name back from config.
+    _smus_setup_config_set stack_name "$_stack_name"
 
     # ---- Short-circuit when the stack is already in a healthy state. -------
     # Re-deploying every run wastes 1-2 minutes uploading templates and
@@ -1044,6 +1243,25 @@ _cfn_bootstrap() {
             # downstream helpers (and `_action_run` --set injection)
             # see the same values whether or not we just deployed.
             _export_role_arns_from_substacks "$_stack_name" "$_region"
+
+            # Persist the discovered IDs so subsequent migrate.sh runs
+            # (and add-glue-databases.sh, status, teardown) read them
+            # from config without having to re-discover via CFN/datazone.
+            # Without this, the short-circuit path (re-run on a
+            # healthy stack) would leave config null, even though the
+            # IDs are right there in the stack outputs.
+            [ -n "$_domain_id" ]        && _smus_setup_config_set smus_domain_id            "$_domain_id"
+            [ -n "$_admin_project_id" ] && _smus_setup_config_set admin_project_id          "$_admin_project_id"
+            [ -n "$_profile_id" ]       && _smus_setup_config_set admin_project_profile_id  "$_profile_id"
+            if [ -n "${MT_DOMAIN_SERVICE_ROLE:-}" ]; then
+                _smus_setup_config_set domain_service_role "$MT_DOMAIN_SERVICE_ROLE"
+            fi
+            if [ -n "${MT_IDENTITY_CENTER_INSTANCE_ARN:-}" ]; then
+                _smus_setup_config_set identity_center_instance_arn "$MT_IDENTITY_CENTER_INSTANCE_ARN"
+            fi
+            if [ -n "${MT_IDENTITY_CENTER_IDENTITY_STORE_ID:-}" ]; then
+                _smus_setup_config_set identity_center_identity_store_id "$MT_IDENTITY_CENTER_IDENTITY_STORE_ID"
+            fi
 
             # Surface repo / Git connection info (with PENDING banner
             # when applicable) on every short-circuited re-run so the
@@ -1108,34 +1326,57 @@ _cfn_bootstrap() {
     # ---- Resolve every CFN parameter through the priority chain ----
     # Priority: CLI flag > env var > smus-setup.config.json > auto-discovered/default.
     # `_resolve_cfn_param` is defined below this function.
+    #
+    # Stack-derived parameters use `_resolve_stack_derived_param` instead,
+    # which SKIPS the persisted-config tier so a `--stack-name` change
+    # always re-derives the default. Operators who pin a value via
+    # CLI / env get their override honored as usual.
 
+    # Domain + admin project names track the stack name so a single
+    # `--stack-name <foo>` flag yields a coherent deployment (stack
+    # `<foo>`, domain `<foo>-domain`, repo `<foo>-domain-migration`).
+    # Operators with multiple stacks against the same domain pin the
+    # name explicitly via `--domain-name`.
     local _domain_name
-    _domain_name="$(_resolve_cfn_param domain_name \
-        "$CLI_DOMAIN_NAME" "${SMUS_DOMAIN_NAME:-}" "smus-seed-domain")"
+    _domain_name="$(_resolve_stack_derived_param domain_name \
+        "$CLI_DOMAIN_NAME" "${SMUS_DOMAIN_NAME:-}" "${_stack_name}-domain")"
     local _admin_project_name
-    _admin_project_name="$(_resolve_cfn_param admin_project_name \
+    _admin_project_name="$(_resolve_stack_derived_param admin_project_name \
         "$CLI_ADMIN_PROJECT_NAME" "${SMUS_ADMIN_PROJECT_NAME:-}" "smus-admin")"
     local _domain_execution_role_name
-    _domain_execution_role_name="$(_resolve_cfn_param domain_execution_role_name \
-        "$CLI_DOMAIN_EXECUTION_ROLE_NAME" "${SMUS_DOMAIN_EXECUTION_ROLE_NAME:-}" "sagemaker-domain-execution")"
+    _domain_execution_role_name="$(_resolve_stack_derived_param domain_execution_role_name \
+        "$CLI_DOMAIN_EXECUTION_ROLE_NAME" "${SMUS_DOMAIN_EXECUTION_ROLE_NAME:-}" "sagemaker-domain-execution-${_stack_name}")"
     local _domain_service_role_name
-    _domain_service_role_name="$(_resolve_cfn_param domain_service_role_name \
-        "$CLI_DOMAIN_SERVICE_ROLE_NAME" "${SMUS_DOMAIN_SERVICE_ROLE_NAME:-}" "AmazonDataZoneServiceRole")"
+    _domain_service_role_name="$(_resolve_stack_derived_param domain_service_role_name \
+        "$CLI_DOMAIN_SERVICE_ROLE_NAME" "${SMUS_DOMAIN_SERVICE_ROLE_NAME:-}" "AmazonDataZoneServiceRole-${_stack_name}")"
     local _automation_role_name
-    _automation_role_name="$(_resolve_cfn_param automation_role_name \
-        "$CLI_AUTOMATION_ROLE_NAME" "${SMUS_AUTOMATION_ROLE_NAME:-}" "smus-seed-automation-role")"
+    _automation_role_name="$(_resolve_stack_derived_param automation_role_name \
+        "$CLI_AUTOMATION_ROLE_NAME" "${SMUS_AUTOMATION_ROLE_NAME:-}" "${_stack_name}-automation-role")"
     local _automation_role_policy_name
-    _automation_role_policy_name="$(_resolve_cfn_param automation_role_policy_name \
-        "$CLI_AUTOMATION_ROLE_POLICY_NAME" "${SMUS_AUTOMATION_ROLE_POLICY_NAME:-}" "smus-seed-automation-policy")"
+    _automation_role_policy_name="$(_resolve_stack_derived_param automation_role_policy_name \
+        "$CLI_AUTOMATION_ROLE_POLICY_NAME" "${SMUS_AUTOMATION_ROLE_POLICY_NAME:-}" "${_stack_name}-automation-policy")"
     local _managed_access_role_name
-    _managed_access_role_name="$(_resolve_cfn_param managed_access_role_name \
-        "$CLI_MANAGED_ACCESS_ROLE_NAME" "${SMUS_MANAGED_ACCESS_ROLE_NAME:-}" "sagemaker-studio-manage-access-role")"
+    _managed_access_role_name="$(_resolve_stack_derived_param managed_access_role_name \
+        "$CLI_MANAGED_ACCESS_ROLE_NAME" "${SMUS_MANAGED_ACCESS_ROLE_NAME:-}" "sagemaker-studio-manage-access-role-${_stack_name}")"
     local _templates_bucket_resolved
-    _templates_bucket_resolved="$(_resolve_cfn_param templates_bucket \
-        "$CLI_TEMPLATES_BUCKET" "${SMUS_TEMPLATES_BUCKET:-}" "smus-seed-cfn-${_account}-${_region}")"
+    _templates_bucket_resolved="$(_resolve_stack_derived_param templates_bucket \
+        "$CLI_TEMPLATES_BUCKET" "${SMUS_TEMPLATES_BUCKET:-}" "${_stack_name}-cfn-${_account}-${_region}")"
+    # The tooling bucket name is constrained by S3's 63-char limit.
+    # Account ID (12) + region (up to 14) + suffix already eats most
+    # of the budget, so we cap the stack-name suffix at 14 chars to
+    # leave headroom. CFN uses this name verbatim on the
+    # `BucketName: !Ref pSUSBPToolingBucketName` resource.
+    local _stack_suffix_short
+    _stack_suffix_short="$(printf '%s' "$_stack_name" | cut -c1-14)"
     local _tooling_bucket
-    _tooling_bucket="$(_resolve_cfn_param tooling_bucket \
-        "$CLI_TOOLING_BUCKET" "${SMUS_TOOLING_BUCKET:-}" "amazon-datazone-tooling-${_account}-${_region}")"
+    _tooling_bucket="$(_resolve_stack_derived_param tooling_bucket \
+        "$CLI_TOOLING_BUCKET" "${SMUS_TOOLING_BUCKET:-}" "amazon-datazone-tooling-${_account}-${_region}-${_stack_suffix_short}")"
+
+    # The DataZone projects bucket has the same length constraint.
+    # Same 14-char cap so it stays under 63.
+    local _projects_bucket
+    _projects_bucket="$(_resolve_stack_derived_param projects_bucket \
+        "" "${SMUS_PROJECTS_BUCKET:-}" "amazon-datazone-projects-${_account}-${_region}-${_stack_suffix_short}")"
     local _lambda_source_prefix
     _lambda_source_prefix="$(_resolve_cfn_param lambda_source_prefix \
         "$CLI_LAMBDA_SOURCE_PREFIX" "${SMUS_LAMBDA_SOURCE_PREFIX:-}" "")"
@@ -1151,7 +1392,7 @@ _cfn_bootstrap() {
     # Default repo name is <domain-name>-migration (preserves the
     # historical convention from migrate.sh's old in-script create).
     local _repo_name
-    _repo_name="$(_resolve_cfn_param repo_name \
+    _repo_name="$(_resolve_stack_derived_param repo_name \
         "$CLI_REPO_NAME" "${SMUS_REPO_NAME:-}" "${_domain_name}-migration")"
     local _repo_url
     _repo_url="$(_resolve_cfn_param repo_url \
@@ -1203,6 +1444,7 @@ _cfn_bootstrap() {
     _smus_setup_config_set managed_access_role_name   "$_managed_access_role_name"
     _smus_setup_config_set templates_bucket           "$_templates_bucket_resolved"
     _smus_setup_config_set tooling_bucket             "$_tooling_bucket"
+    _smus_setup_config_set projects_bucket            "$_projects_bucket"
     _smus_setup_config_set lambda_source_prefix       "$_lambda_source_prefix"
     [ -n "$_vpc_id" ]            && _smus_setup_config_set vpc_id "$_vpc_id"
     [ -n "$_subnet_csv" ]        && _smus_setup_config_set subnet_ids "$_subnet_csv"
@@ -1227,6 +1469,7 @@ _cfn_bootstrap() {
         --arg vpc_id                       "$_vpc_id" \
         --arg subnet_ids                   "$_subnet_csv" \
         --arg tooling_bucket               "$_tooling_bucket" \
+        --arg projects_bucket              "$_projects_bucket" \
         --arg sso_group_id                 "$_sso_group_id" \
         --arg sso_instance_arn             "$_sso_instance_arn" \
         --arg admin_project_name           "$_admin_project_name" \
@@ -1247,6 +1490,7 @@ _cfn_bootstrap() {
             {ParameterKey: "pSUSToolingBPVpcId",              ParameterValue: $vpc_id},
             {ParameterKey: "pSUSToolingBPSubnets",            ParameterValue: $subnet_ids},
             {ParameterKey: "pSUSBPToolingBucketName",         ParameterValue: $tooling_bucket},
+            {ParameterKey: "pSUSProjectsBucketName",          ParameterValue: $projects_bucket},
             {ParameterKey: "pSSOGroupID",                     ParameterValue: $sso_group_id},
             {ParameterKey: "pSSOInstanceArn",                 ParameterValue: $sso_instance_arn},
             {ParameterKey: "pAdminProjectName",               ParameterValue: $admin_project_name},
@@ -1574,7 +1818,8 @@ _smus_session_bootstrap() {
     _account="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")"
     [ -z "$_account" ] && { echo "==> SMUS session bootstrap: skipped (no caller account)"; return 0; }
 
-    local _bucket="amazon-datazone-tooling-${_account}-${_region}"
+    local _bucket
+    _bucket="$(_resolve_tooling_bucket "$_account" "$_region")"
     if ! aws s3api head-bucket --bucket "$_bucket" >/dev/null 2>&1; then
         echo "==> SMUS session bootstrap: skipped (tooling bucket ${_bucket} absent)"
         return 0
@@ -2108,7 +2353,8 @@ _smus_codecommit_grant() {
 
 _teardown_destroy_smus_stack() {
     local _apply="$1" _region="$2" _domain_id="$3" _project_id="$4"
-    local _stack_name="smus-seed"
+    local _stack_name
+    _stack_name="$(_resolve_stack_name)"
 
     # Inner helper invoked when the stack delete succeeds. Cleans up
     # resources that survive the CFN delete because they're either
@@ -2125,7 +2371,8 @@ _teardown_destroy_smus_stack() {
         local _account
         _account="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")"
         if [ -n "$_account" ]; then
-            local _bucket="amazon-datazone-tooling-${_account}-${_region}"
+            local _bucket
+            _bucket="$(_resolve_tooling_bucket "$_account" "$_region")"
             if aws s3api head-bucket --bucket "$_bucket" >/dev/null 2>&1; then
                 # Drain every version + delete-marker via boto3 (the AWS
                 # CLI's `s3 rm --recursive` doesn't traverse versions on
@@ -2614,6 +2861,14 @@ _action_setup() {
     _aws_required || exit $?
     _jq_required  || exit $?
 
+    # Auto-wipe stale stack-derived values when the operator passed
+    # a different `--stack-name` than the one persisted from the last
+    # deploy. Without this, the resolver chain's config tier wins for
+    # `domain_name`, `admin_project_name`, etc. — silently producing
+    # a deployment under one stack name with the previous stack's
+    # domain. See "Three targeted fixes" in the README operator notes.
+    _setup_auto_wipe_on_stack_change
+
     if [ "$MODE_FLAG" = "--apply" ]; then
         _smus_setup_state_mark in_progress
     fi
@@ -2752,8 +3007,10 @@ _action_teardown_via_lambda() {
             echo "ERROR: teardown --apply requires a TTY for confirmation; pass --yes for non-interactive use" >&2
             exit 64
         fi
+        local _stack_name_for_prompt
+        _stack_name_for_prompt="$(_resolve_stack_name)"
         {
-            echo "WARNING: teardown will issue 'aws cloudformation delete-stack smus-seed'."
+            echo "WARNING: teardown will issue 'aws cloudformation delete-stack ${_stack_name_for_prompt}'."
             echo "         The in-stack rPreDelete Lambda runs the 9 hardening passes,"
             echo "         then CFN deletes the rest of the stack."
             printf "Type 'teardown' to confirm: "
@@ -2770,7 +3027,8 @@ _action_teardown_via_lambda() {
     _jq_required  || exit $?
 
     local _region="${AWS_DEFAULT_REGION:-us-east-1}"
-    local _stack_name="smus-seed"
+    local _stack_name
+    _stack_name="$(_resolve_stack_name)"
     local _apply=0
     [ "$MODE_FLAG" = "--apply" ] && _apply=1
 
@@ -2919,7 +3177,8 @@ _action_teardown() {
     local _account
     _account="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "")"
     if [ -n "$_account" ]; then
-        local _bucket="amazon-datazone-tooling-${_account}-${_region}"
+        local _bucket
+        _bucket="$(_resolve_tooling_bucket "$_account" "$_region")"
         if aws s3api head-bucket --bucket "$_bucket" >/dev/null 2>&1; then
             local _kms_key_id
             _kms_key_id="$(aws s3api get-bucket-encryption --bucket "$_bucket" \

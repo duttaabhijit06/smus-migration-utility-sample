@@ -690,6 +690,67 @@ _resolve_byod_or_die() {
 }
 
 
+# -----------------------------------------------------------------------------
+# _migrate_auto_wipe_on_domain_change
+#
+# Wipes migration state and migration config when the persisted
+# `smus_domain_id` in `state/migration.state.json` (or
+# `config/migration.config.json`) doesn't match the live one in
+# `config/smus-setup.config.json`. Without this, a `migrate.sh run`
+# after a fresh `smus-setup.sh setup` against a different stack
+# resumes from a partial state file pointing at the old domain.
+#
+# Backups (`<path>.bak.<timestamp>`) preserve the previous content
+# so an operator can recover if the wipe was triggered by accident.
+#
+# Skipped on dry-run and on BYOD mode (where the operator is
+# explicitly targeting a different domain).
+# -----------------------------------------------------------------------------
+_migrate_auto_wipe_on_domain_change() {
+    if [ "$MODE_FLAG" != "--apply" ] || [ "$BRING_YOUR_OWN" -eq 1 ]; then
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local _setup_cfg="${ROOT_DIR}/config/smus-setup.config.json"
+    [ ! -f "$_setup_cfg" ] && return 0
+
+    local _live_domain
+    _live_domain="$(jq -r '.smus_domain_id // empty' "$_setup_cfg" 2>/dev/null)"
+    [ -z "$_live_domain" ] && return 0
+
+    local _stale_domain=""
+    if [ -f "$STATE_PATH" ]; then
+        _stale_domain="$(jq -r '.smus_domain_id // empty' "$STATE_PATH" 2>/dev/null)"
+    fi
+    if [ -z "$_stale_domain" ] && [ -f "$CONFIG_PATH" ]; then
+        _stale_domain="$(jq -r '.smus_domain_id // empty' "$CONFIG_PATH" 2>/dev/null)"
+    fi
+
+    if [ -z "$_stale_domain" ] || [ "$_stale_domain" = "$_live_domain" ]; then
+        return 0
+    fi
+
+    echo "==> Auto-wipe: stale migration state detected"
+    echo "    State references domain '${_stale_domain}', but smus-setup is now '${_live_domain}'."
+    echo "    Wiping migration state and config so the run starts fresh against the new domain."
+
+    local _ts
+    _ts="$(date +%s)"
+    if [ -f "$STATE_PATH" ]; then
+        mv "$STATE_PATH" "${STATE_PATH}.bak.${_ts}"
+        echo "    + wiped $(basename "$STATE_PATH") (backup: ${STATE_PATH}.bak.${_ts})"
+    fi
+    if [ -f "$CONFIG_PATH" ]; then
+        mv "$CONFIG_PATH" "${CONFIG_PATH}.bak.${_ts}"
+        echo "    + wiped $(basename "$CONFIG_PATH") (backup: ${CONFIG_PATH}.bak.${_ts})"
+    fi
+    echo
+}
+
+
 _action_run() {
     echo "==> migration tool"
     echo "==> Action:   run"
@@ -707,6 +768,13 @@ _action_run() {
         echo "==> Passing:  ${PASSTHROUGH[*]}"
     fi
     echo
+
+    # Auto-wipe stale migration state when it references a domain
+    # that's no longer the active SMUS deployment. Without this, a
+    # `migrate.sh run` after `smus-setup.sh setup` against a different
+    # stack would silently resume from a partial state file pointing
+    # at the old (deleted or different) domain.
+    _migrate_auto_wipe_on_domain_change
 
     # Gate: in default mode require smus-setup completed; in BYOD
     # mode resolve the domain/project/profile IDs from AWS or from
@@ -808,6 +876,78 @@ _action_run() {
             echo "==> Pre-set:  ${_key}=${_val}"
         fi
     done
+
+    # Cross-namespace key mappings: smus-setup.config.json stores some
+    # values under different key names than the migration tool's
+    # config schema expects. Translate them so the operator doesn't
+    # have to answer prompts that the setup script already knows the
+    # answers to.
+    #   smus-setup `domain_name`         → migration tool `smus_domain_name`
+    #   smus-setup `admin_project_name`  → migration tool `admin_project_name` (same)
+    local _src _dst
+    for mapping in "domain_name:smus_domain_name" "admin_project_name:admin_project_name"; do
+        _src="${mapping%%:*}"
+        _dst="${mapping##*:}"
+        _val="$(_smus_setup_config_get "$_src")"
+        if [ -n "$_val" ] && ! _has_set_for "$_dst"; then
+            args+=("--set" "${_dst}=${_val}")
+            echo "==> Pre-set:  ${_dst}=${_val} (from smus-setup.${_src})"
+        fi
+    done
+
+    # AWS region + caller's account — both always knowable, never
+    # worth prompting for. AWS_DEFAULT_REGION is set by `--region`
+    # earlier in this script; account ID comes from sts.
+    if ! _has_set_for aws_region; then
+        local _region="${AWS_DEFAULT_REGION:-us-east-1}"
+        args+=("--set" "aws_region=${_region}")
+        echo "==> Pre-set:  aws_region=${_region}"
+    fi
+    if ! _has_set_for source_account_id; then
+        local _acct
+        _acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null | grep -v '^None$' || true)"
+        if [ -n "$_acct" ]; then
+            args+=("--set" "source_account_id=${_acct}")
+            echo "==> Pre-set:  source_account_id=${_acct}"
+        fi
+    fi
+
+    # MWAA DAG bucket — derivable from the live environment when we
+    # already know the env name (either pre-set or in migration config).
+    # Skips silently when MWAA env can't be discovered (BYOD with no MWAA,
+    # or legitimate operator override).
+    if ! _has_set_for mwaa_dag_bucket_name; then
+        local _mwaa_env _bucket_arn _bucket_name
+        _mwaa_env=""
+        # Look for an explicit --set mwaa_environment_name passthrough.
+        local _i=0
+        local _n="${#PASSTHROUGH[@]}"
+        while [ "$_i" -lt "$_n" ]; do
+            case "${PASSTHROUGH[$_i]:-}" in
+                --set=mwaa_environment_name=*) _mwaa_env="${PASSTHROUGH[$_i]#*=mwaa_environment_name=}" ;;
+                --set)
+                    local _next="${PASSTHROUGH[$((_i+1))]:-}"
+                    case "$_next" in
+                        mwaa_environment_name=*) _mwaa_env="${_next#mwaa_environment_name=}" ;;
+                    esac ;;
+            esac
+            _i=$((_i + 1))
+        done
+        # Fall back to migration.config.json (a previous run may have set it).
+        if [ -z "$_mwaa_env" ] && [ -f "$CONFIG_PATH" ]; then
+            _mwaa_env="$(jq -r '.mwaa_environment_name // empty' "$CONFIG_PATH" 2>/dev/null || true)"
+        fi
+        if [ -n "$_mwaa_env" ]; then
+            _bucket_arn="$(aws mwaa get-environment --name "$_mwaa_env" \
+                --query 'Environment.SourceBucketArn' --output text 2>/dev/null \
+                | grep -v '^None$' || true)"
+            if [ -n "$_bucket_arn" ]; then
+                _bucket_name="${_bucket_arn##*:::}"
+                args+=("--set" "mwaa_dag_bucket_name=${_bucket_name}")
+                echo "==> Pre-set:  mwaa_dag_bucket_name=${_bucket_name} (from MWAA env ${_mwaa_env})"
+            fi
+        fi
+    fi
 
     # The migration tool's Prompter expects `git_connection_id` (the
     # historical key from when datazone create-connection was the API).
