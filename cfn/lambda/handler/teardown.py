@@ -67,11 +67,20 @@ def run(props: dict) -> dict:
     domain_id = props.get("DomainId", "")
     admin_project_id = props.get("AdminProjectId", "")
     region = props.get("Region") or boto3.Session().region_name or "us-east-1"
+    # As of the stack-name-suffix work, the tooling bucket is no
+    # longer at a predictable `amazon-datazone-tooling-<acct>-<region>`
+    # path — it includes a stack-name suffix capped at 14 chars. The
+    # parent stack passes the live name in `ToolingBucketName`; we
+    # use it directly when present, falling back to the legacy
+    # pattern only for backward-compat with old stacks.
+    tooling_bucket_override = (props.get("ToolingBucketName") or "").strip()
 
     LOG.info("teardown.run domain=%s project=%s region=%s", domain_id, admin_project_id, region)
 
     # Discover runtime state at delete time (props may be stale).
     runtime = _discover_runtime(domain_id, admin_project_id, region)
+    if tooling_bucket_override:
+        runtime["tooling_bucket"] = tooling_bucket_override
     LOG.info("runtime=%s", json.dumps(runtime))
 
     # Pass H + I: KMS strip + IAM inline detach (fast, do these first
@@ -219,12 +228,23 @@ def _drain_athena_sessions(project_id: str, region: str) -> None:
     expected_wg = f"sagemaker-studio-spark-workgroup-{project_id}"
     target_workgroups: list[str] = []
     try:
-        paginator = athena.get_paginator("list_work_groups")
-        for page in paginator.paginate():
-            for wg in page.get("WorkGroups", []):
+        # Athena's `list_work_groups` doesn't have a boto3 paginator, so
+        # we iterate manually with NextToken. Practically the SMUS-owned
+        # workgroup count is small (1 per project + a few SMUS-owned
+        # primary/admin workgroups), but this loop is robust to growth.
+        next_token = None
+        while True:
+            kwargs = {}
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = athena.list_work_groups(**kwargs)
+            for wg in resp.get("WorkGroups", []):
                 name = wg.get("Name", "")
                 if name == expected_wg or project_id in name:
                     target_workgroups.append(name)
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
     except athena.exceptions.ClientError as exc:
         LOG.warning("  list_work_groups failed: %s", exc)
         return
@@ -236,29 +256,35 @@ def _drain_athena_sessions(project_id: str, region: str) -> None:
     for wg in target_workgroups:
         # Only ACTIVE / IDLE / BUSY / CREATING / FAILED sessions block
         # workgroup delete; TERMINATED / TERMINATING are no-ops.
+        # `list_sessions` also doesn't have a boto3 paginator — use
+        # the same manual NextToken loop as list_work_groups.
+        terminated = 0
+        next_token = None
         try:
-            session_pages = athena.get_paginator("list_sessions").paginate(
-                WorkGroup=wg,
-            )
+            while True:
+                kwargs = {"WorkGroup": wg}
+                if next_token:
+                    kwargs["NextToken"] = next_token
+                resp = athena.list_sessions(**kwargs)
+                for session in resp.get("Sessions", []):
+                    state = (session.get("Status") or {}).get("State", "")
+                    if state in ("TERMINATED", "TERMINATING"):
+                        continue
+                    sid = session.get("SessionId", "")
+                    if not sid:
+                        continue
+                    try:
+                        athena.terminate_session(SessionId=sid)
+                        LOG.info("  + terminated %s session %s (state=%s)", wg, sid, state)
+                        terminated += 1
+                    except athena.exceptions.ClientError as exc:
+                        LOG.warning("  terminate_session failed on %s: %s", sid, exc)
+                next_token = resp.get("NextToken")
+                if not next_token:
+                    break
         except athena.exceptions.ClientError as exc:
             LOG.warning("  list_sessions failed for %s: %s", wg, exc)
             continue
-
-        terminated = 0
-        for spage in session_pages:
-            for session in spage.get("Sessions", []):
-                state = (session.get("Status") or {}).get("State", "")
-                if state in ("TERMINATED", "TERMINATING"):
-                    continue
-                sid = session.get("SessionId", "")
-                if not sid:
-                    continue
-                try:
-                    athena.terminate_session(SessionId=sid)
-                    LOG.info("  + terminated %s session %s (state=%s)", wg, sid, state)
-                    terminated += 1
-                except athena.exceptions.ClientError as exc:
-                    LOG.warning("  terminate_session failed on %s: %s", sid, exc)
         if terminated == 0:
             LOG.info("  = no live sessions on %s", wg)
 

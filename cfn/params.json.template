@@ -9,6 +9,7 @@
     {"ParameterKey": "pSUSToolingBPVpcId",              "ParameterValue": "{{vpc_id}}"},
     {"ParameterKey": "pSUSToolingBPSubnets",            "ParameterValue": "{{subnet_ids}}"},
     {"ParameterKey": "pSUSBPToolingBucketName",         "ParameterValue": "{{tooling_bucket}}"},
+    {"ParameterKey": "pSUSProjectsBucketName",          "ParameterValue": "{{projects_bucket}}"},
     {"ParameterKey": "pSSOGroupID",                     "ParameterValue": "{{sso_group_id}}"},
     {"ParameterKey": "pSSOInstanceArn",                 "ParameterValue": "{{sso_instance_arn}}"},
     {"ParameterKey": "pAdminProjectName",               "ParameterValue": "{{admin_project_name}}"},

@@ -27,6 +27,20 @@ Parameters:
   pSSOInstanceArn:
     Type: String
     Description: IDC instance ARN — pins the domain's SingleSignOn to the account-local instance so DataZone resolves user/group IDs against the right identity store.
+  pSUSProjectsBucketName:
+    Type: String
+    Description: >-
+      Name of the S3 bucket that DataZone uses for project storage.
+      Operator-supplied so it can be made stack-unique (the script
+      caps the stack-name suffix to fit S3's 63-char limit).
+  pParentStackName:
+    Type: String
+    Description: >-
+      Name of the top-level (parent) CFN stack. Threaded through from
+      master-stack.yaml as `!Ref AWS::StackName`. Used to suffix
+      named IAM resources for stack uniqueness without picking up the
+      auto-generated nested-stack name (which would overflow IAM's
+      64-char role-name limit).
 
 Resources:
   rSUSDomainKMSKey:
@@ -337,7 +351,11 @@ Resources:
   rSUSToolingProvisioningRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: sagemaker-studio-provisioning-role
+      # Suffix with the parent stack name (NOT ${AWS::StackName} —
+      # that would resolve to the nested sub-stack's auto-generated
+      # name like `smus-admin-stack-DomainStack-1A2B3C` which
+      # overflows IAM's 64-char roleName limit).
+      RoleName: !Sub sagemaker-studio-provisioning-role-${pParentStackName}
       Description: SageMaker Unified Studio Tooling provisioning role.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -367,7 +385,13 @@ Resources:
     DeletionPolicy: Delete
     UpdateReplacePolicy: Delete
     Properties:
-      BucketName: !Sub 'amazon-datazone-projects-${AWS::AccountId}-${AWS::Region}'
+      # Suffix with the parent stack name so two SMUS deployments
+      # in the same account+region get distinct project buckets.
+      # S3 bucket names are limited to 63 chars; the fixed prefix
+      # (amazon-datazone-projects-<acct>-<region>) already eats
+      # ~49 chars, so we use a parameter the operator-side script
+      # passes in (already capped at 14 chars from the stack name).
+      BucketName: !Ref pSUSProjectsBucketName
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -396,7 +420,9 @@ Resources:
   rSUSLFRegistrationRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: smus-seed-lf-registration-role
+      # Use parent stack name (see comment on rSUSToolingProvisioningRole
+      # above for why ${AWS::StackName} can't be used here).
+      RoleName: !Sub smus-seed-lf-registration-role-${pParentStackName}
       Description: Data-access role used by Lake Formation to register source S3 prefixes with WithFederation=true.
       AssumeRolePolicyDocument:
         Version: '2012-10-17'

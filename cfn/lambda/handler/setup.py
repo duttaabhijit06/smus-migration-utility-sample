@@ -186,6 +186,17 @@ def run(props: dict) -> dict:
 
     LOG.info("project_user_role=%s lakehouse_env=%s", project_user_role, lakehouse_env_id)
 
+    # ------ Section 0: Orphan cleanup (idempotent self-heal) ------
+    # Drop any glue_db_<envId> Glue databases left behind by previous
+    # deploys whose teardown didn't reach Pass D (the rPreDelete
+    # Lambda's orphan sweep). Without this, the migration tool's
+    # step 04 inventory picks up these orphans even though the
+    # filter was added — at least until a successful teardown
+    # cleans them. Doing this on setup means each fresh deploy
+    # leaves the Glue catalog clean regardless of past teardown
+    # health.
+    _drop_orphan_glue_dbs_on_setup(region)
+
     # ------ Section 1: Lake Formation bootstrap ------
     _lakeformation_bootstrap(
         region=region,
@@ -293,6 +304,76 @@ def _discover_project_runtime(domain_id: str, project_id: str, region: str) -> t
         time.sleep(10)
 
     return project_user_role, lakehouse_env_id
+
+
+def _drop_orphan_glue_dbs_on_setup(region: str) -> None:
+    """Setup-side mirror of teardown's Pass D: drop orphan glue_db_*.
+
+    A glue_db_<envId> is an orphan when its `LocationUri` references
+    a DataZone domain that no longer exists. The legitimate ones (the
+    new domain this stack just created, plus any other live domains)
+    are left alone.
+
+    Same scope-and-decision rules as `teardown.py:_drop_orphan_glue_dbs`,
+    but called from setup so a fresh deploy after a partial teardown
+    self-heals. Without this, step 04's `relationalFilterConfigurations`
+    builder would still see orphan databases through the `glue_db_`
+    prefix and (until we added the prefix filter) try to crawl them.
+    """
+    LOG.info("Section 0: drop orphan glue_db_*")
+    glue = boto3.client("glue", region_name=region)
+    lf = boto3.client("lakeformation", region_name=region)
+    dz = boto3.client("datazone", region_name=region)
+    sts = boto3.client("sts", region_name=region)
+    caller_arn = sts.get_caller_identity()["Arn"]
+    if ":assumed-role/" in caller_arn:
+        parts = caller_arn.split(":")
+        role_name = parts[5].split("/")[1]
+        principal = f"arn:aws:iam::{parts[4]}:role/{role_name}"
+    else:
+        principal = caller_arn
+
+    active_domain_ids: set[str] = set()
+    try:
+        for d in dz.list_domains().get("items", []):
+            active_domain_ids.add(d["id"])
+    except dz.exceptions.ClientError as exc:
+        LOG.warning("  list_domains failed; skipping orphan sweep: %s", exc)
+        return
+    LOG.info("  active domains in region: %s", sorted(active_domain_ids) or ["<none>"])
+
+    paginator = glue.get_paginator("get_databases")
+    for page in paginator.paginate():
+        for db in page.get("DatabaseList", []):
+            db_name = db["Name"]
+            if not db_name.startswith("glue_db_"):
+                continue
+            location = db.get("LocationUri", "") or ""
+            referenced = [d for d in active_domain_ids if d in location]
+            if referenced:
+                LOG.info("  = keeping %s (live domain %s)", db_name, referenced[0])
+                continue
+            LOG.info("  + dropping orphan %s (LocationUri=%s)", db_name, location)
+            try:
+                lf.grant_permissions(
+                    Principal={"DataLakePrincipalIdentifier": principal},
+                    Resource={"Database": {"Name": db_name}},
+                    Permissions=["DROP"],
+                )
+            except lf.exceptions.ClientError:
+                pass
+            try:
+                tpaginator = glue.get_paginator("get_tables")
+                for tpage in tpaginator.paginate(DatabaseName=db_name):
+                    for table in tpage.get("TableList", []):
+                        try:
+                            glue.delete_table(DatabaseName=db_name, Name=table["Name"])
+                        except glue.exceptions.ClientError:
+                            pass
+                glue.delete_database(Name=db_name)
+                LOG.info("    + dropped %s", db_name)
+            except glue.exceptions.ClientError as exc:
+                LOG.warning("    drop %s failed: %s", db_name, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +509,20 @@ def _smus_session_bootstrap(
     except (s3.exceptions.ClientError, kms.exceptions.NotFoundException) as exc:
         LOG.warning("  KMS policy update skipped: %s", exc)
 
-    # 2d. Re-register source S3 prefixes with WithFederation=true.
+    # 2d. Repair orphan LF registrations from prior deploys.
+    # Different stack names get different LF-registration role names
+    # (we suffix with the stack name for uniqueness — see comment on
+    # rSUSLFRegistrationRole in sus-domain-stack.yaml). When a previous
+    # stack was torn down without first deregistering its S3 prefixes,
+    # those registrations stay in LF pointing at a now-deleted role.
+    # The next deploy creates a new role with a different name; queries
+    # against the orphan prefixes fail with `Unable to assume role`
+    # because the role ARN is dead. This pass walks every LF
+    # registration whose role no longer exists in IAM and rewrites it
+    # to use the live registration role.
+    _repair_orphan_lf_registrations(lf, lf_reg_role_arn, region)
+
+    # 2e. Re-register source S3 prefixes with WithFederation=true.
     _reregister_s3_prefixes(glue, lf, lf_reg_role_arn, region)
 
     LOG.info("Section 2: complete")
@@ -466,6 +560,174 @@ def _ensure_kms_statement(kms_client, key_id: str, role_arn: str, account_id: st
     policy["Statement"] = statements
     kms_client.put_key_policy(KeyId=key_id, PolicyName="default", Policy=json.dumps(policy))
     LOG.info("  + KMS key policy now grants Encrypt/Decrypt/GenerateDataKey* to %s", role_arn.split("/")[-1])
+
+
+def _repair_orphan_lf_registrations(lf_client, lf_reg_role_arn: str, region: str) -> None:
+    """Walk every LF registration and rewrite ones we own to use the live role.
+
+    "Owned" registrations are those whose ResourceArn references either:
+
+      1. A source data bucket — one that contains seed Glue tables.
+         These bucket roots and ANY sub-prefix beneath them
+         (`/raw`, `/raw/msk`, `/curated/customers`, etc.) belong to
+         the data we're surfacing to SMUS.
+      2. This stack's tooling or projects bucket — derived from the
+         caller account ID and region (the stack-suffixed names are
+         in the form `amazon-datazone-{tooling,projects}-<acct>-<region>-<stack14>`).
+
+    For both kinds, we deregister the existing entry and re-register
+    with the live `lf_reg_role_arn`. This means the role created by
+    THIS stack create is the canonical principal LF uses to assume
+    into our data — no matter what role a previous (torn-down) stack
+    left behind.
+
+    Registrations OUTSIDE our ownership zone (e.g., another live
+    stack's tooling bucket in the same account) are left alone. If
+    their role is missing from IAM, we deregister them as cleanup
+    but don't try to "claim" them.
+
+    All operations are best-effort — a failure on one registration
+    is logged and skipped, never escalates to the caller.
+    """
+    LOG.info("  + repair pass: walk LF registrations + rewrite owned ones to %s",
+             lf_reg_role_arn)
+
+    iam = boto3.client("iam", region_name=region)
+    glue = boto3.client("glue", region_name=region)
+
+    # Build the set of source data buckets (those backing seed Glue
+    # tables). Any registration whose path is on one of these buckets
+    # — bucket root or sub-prefix — is in our ownership zone.
+    source_buckets: set[str] = set()
+    try:
+        for page in glue.get_paginator("get_databases").paginate():
+            for db in page.get("DatabaseList", []):
+                if db["Name"].startswith("glue_db_"):
+                    continue
+                try:
+                    for tpage in glue.get_paginator("get_tables").paginate(
+                            DatabaseName=db["Name"]):
+                        for table in tpage.get("TableList", []):
+                            loc = (table.get("StorageDescriptor") or {}).get("Location", "")
+                            if loc.startswith("s3://"):
+                                source_buckets.add(loc[5:].split("/", 1)[0])
+                except glue.exceptions.ClientError:
+                    continue
+    except glue.exceptions.ClientError as exc:
+        LOG.warning("    repair pass: get_databases failed: %s", exc)
+
+    # Stack-owned tooling/projects bucket name patterns.
+    # We get the actual names by inspecting our own role ARN (it has
+    # the suffix we use everywhere) and reconstructing the bucket
+    # names. If the role name doesn't follow the pattern (operator
+    # override), the patterns may not match — in which case those
+    # registrations get the orphan-detection treatment below.
+    role_name = lf_reg_role_arn.split("/")[-1]
+    # Pattern: smus-seed-lf-registration-role-<stackname>
+    stack_suffix = ""
+    prefix_marker = "smus-seed-lf-registration-role-"
+    if role_name.startswith(prefix_marker):
+        stack_suffix = role_name[len(prefix_marker):]
+    # Bucket names cap stack suffix at 14 chars (see scripts/smus-setup.sh).
+    stack_suffix_short = stack_suffix[:14]
+
+    sts = boto3.client("sts", region_name=region)
+    account_id = sts.get_caller_identity()["Account"]
+    owned_bucket_prefixes: list[str] = []
+    if stack_suffix_short:
+        owned_bucket_prefixes.append(
+            f"amazon-datazone-tooling-{account_id}-{region}-{stack_suffix_short}")
+        owned_bucket_prefixes.append(
+            f"amazon-datazone-projects-{account_id}-{region}-{stack_suffix_short}")
+
+    LOG.info("    repair pass: source buckets=%s, stack=%s",
+             sorted(source_buckets), stack_suffix or "<unknown>")
+
+    # Walk every registration. NOTE: list_resources is NOT paginated
+    # by boto3 (the API supports NextToken but the client doesn't
+    # expose a paginator). Same shape as Athena's list_work_groups
+    # — manual NextToken loop required.
+    rewritten = 0
+    deregistered_orphans = 0
+    skipped_other = 0
+    all_resources: list = []
+    next_token = None
+    try:
+        while True:
+            kwargs = {}
+            if next_token:
+                kwargs["NextToken"] = next_token
+            resp = lf_client.list_resources(**kwargs)
+            all_resources.extend(resp.get("ResourceInfoList", []) or [])
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+    except lf_client.exceptions.ClientError as exc:
+        LOG.warning("    repair pass: list_resources failed: %s", exc)
+        return
+
+    for entry in all_resources:
+        arn = entry.get("ResourceArn", "")
+        cur_role = entry.get("RoleArn", "")
+        if not arn.startswith("arn:aws:s3:::"):
+            continue
+        path = arn[len("arn:aws:s3:::"):]
+        bucket = path.split("/", 1)[0]
+
+        is_owned = (
+            bucket in source_buckets
+            or any(bucket == p or bucket.startswith(p) for p in owned_bucket_prefixes)
+        )
+        if cur_role == lf_reg_role_arn and is_owned:
+            # Already correct — nothing to do.
+            continue
+
+        if is_owned:
+            # Rewrite to use our live role.
+            try:
+                lf_client.deregister_resource(ResourceArn=arn)
+            except lf_client.exceptions.EntityNotFoundException:
+                pass
+            except lf_client.exceptions.ClientError:
+                pass
+            try:
+                lf_client.register_resource(
+                    ResourceArn=arn,
+                    UseServiceLinkedRole=False,
+                    RoleArn=lf_reg_role_arn,
+                    WithFederation=True,
+                    HybridAccessEnabled=True,
+                )
+                LOG.info("    + claimed %s (was: %s)", arn, cur_role or "<no role>")
+                rewritten += 1
+            except lf_client.exceptions.AlreadyExistsException:
+                pass
+            except lf_client.exceptions.ClientError as exc:
+                LOG.warning("    register_resource failed on %s: %s", arn, exc)
+            continue
+
+        # Not owned. If the current role is missing from IAM, this is
+        # a straggler from a torn-down stack — deregister it.
+        if cur_role and cur_role.startswith("arn:aws:iam::"):
+            cur_role_name = cur_role.split("/")[-1]
+            try:
+                iam.get_role(RoleName=cur_role_name)
+                # Role exists, leave the registration alone (likely
+                # owned by another live stack).
+                skipped_other += 1
+                continue
+            except iam.exceptions.NoSuchEntityException:
+                # Orphan: role gone, registration stale.
+                try:
+                    lf_client.deregister_resource(ResourceArn=arn)
+                    LOG.info("    + deregistered orphan %s (role %s missing)",
+                             arn, cur_role_name)
+                    deregistered_orphans += 1
+                except lf_client.exceptions.ClientError as exc:
+                    LOG.warning("    deregister_resource failed on %s: %s", arn, exc)
+
+    LOG.info("    repair pass: claimed=%d, deregistered_orphans=%d, skipped_other=%d",
+             rewritten, deregistered_orphans, skipped_other)
 
 
 def _reregister_s3_prefixes(glue_client, lf_client, lf_reg_role_arn: str, region: str) -> None:

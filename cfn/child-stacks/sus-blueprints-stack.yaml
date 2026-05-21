@@ -37,6 +37,14 @@ Parameters:
   pSUSBPToolingBucketName:
     Type: String
 
+  pParentStackName:
+    Type: String
+    Description: >-
+      Name of the top-level (parent) CFN stack. Threaded through from
+      master-stack.yaml. Used to suffix named IAM resources without
+      picking up the auto-generated nested-stack name (which would
+      overflow IAM's 64-char roleName limit).
+
 Resources:
   # ---------------------------------------------------------------------------
   # IAM: provisioning role assumed by DataZone to provision project resources.
@@ -59,7 +67,14 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       Description: Role used by SUS Domain to provision resources.
-      RoleName: !Sub AmazonSageMakerProvisioningRole-${AWS::AccountId}
+      # Suffix with the parent stack name so two stacks deployed
+      # against the same account (e.g. `smus-seed` for the tutorial
+      # plus `acme-platform-smus` for production) get distinct role
+      # names and don't collide. Account ID is kept for traceability
+      # in cross-account audit logs. Use pParentStackName (NOT
+      # ${AWS::StackName}) — the latter resolves to the nested
+      # sub-stack's auto-generated name.
+      RoleName: !Sub AmazonSageMakerProvisioningRole-${AWS::AccountId}-${pParentStackName}
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:

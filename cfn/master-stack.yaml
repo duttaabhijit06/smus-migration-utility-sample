@@ -66,6 +66,14 @@ Parameters:
     Type: String
     Description: IDC instance ARN — pins the domain's SingleSignOn to the account-local instance.
 
+  pSUSProjectsBucketName:
+    Type: String
+    Description: >-
+      Name of the DataZone projects S3 bucket. Made stack-unique by
+      smus-setup.sh (e.g. amazon-datazone-projects-<acct>-<region>-<stack>)
+      so multiple SMUS deployments in the same account+region don't
+      collide. Operator can override directly.
+
   pAdminProjectName:
     Type: String
     Default: smus-admin
@@ -195,6 +203,8 @@ Resources:
         pSUSDomainAutomationRolePolicyName: !Ref pSUSDomainAutomationRolePolicyName
         pSSOGroupID: !Ref pSSOGroupID
         pSSOInstanceArn: !Ref pSSOInstanceArn
+        pSUSProjectsBucketName: !Ref pSUSProjectsBucketName
+        pParentStackName: !Ref AWS::StackName
 
   BlueprintStack:
     Type: AWS::CloudFormation::Stack
@@ -208,6 +218,7 @@ Resources:
         pSUSDomainExecutionRoleArn: !GetAtt DomainStack.Outputs.oSUSDomainExecutionRoleArn
         pSUSToolingBPSubnets: !Ref pSUSToolingBPSubnets
         pSUSToolingBPVpcId: !Ref pSUSToolingBPVpcId
+        pParentStackName: !Ref AWS::StackName
 
   ProjectProfileStack:
     Type: AWS::CloudFormation::Stack
@@ -394,6 +405,12 @@ Resources:
       Region: !Ref AWS::Region
       DomainId: !GetAtt DomainStack.Outputs.oSUSDomainID
       AdminProjectId: !GetAtt ProjectStack.Outputs.oAdminProjectId
+      # Pass the actual tooling bucket name so the Lambda's
+      # _discover_runtime doesn't have to reconstruct it from a
+      # naming convention. Since the bucket is now stack-suffixed,
+      # the bare `amazon-datazone-tooling-<acct>-<region>` pattern
+      # the Lambda used to assume no longer matches.
+      ToolingBucketName: !Ref pSUSBPToolingBucketName
 
 
 Outputs:
