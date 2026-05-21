@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  SMUS bootstrap — Lambda build stack. CodeBuild zips loose .py files
+  uploaded to ${pSourceBucket}/${pSourcePrefix}lambda/ into a Lambda
+  deployment zip and writes it to ${pBuildBucket}/setup_handler.zip.
+  A small inline-ZipFile trigger Lambda kicks the build during stack
+  create, waits for it to finish, and signals CFN.
+
+# Why this exists:
+#   CFN's `AWS::Lambda::Function.Code` only accepts `ZipFile` (4 KiB
+#   inline cap), `S3Bucket`+`S3Key` (must point to a zip), or `ImageUri`.
+#   The customer wanted to upload UNZIPPED .py files to S3 and have
+#   CFN handle the rest — that means CFN must zip them inside the
+#   stack. The native CFN primitive for "run a build during stack
+#   create" is CodeBuild + a triggering Custom Resource.
+
+Parameters:
+  pSourceBucket:
+    Type: String
+    Description: >-
+      S3 bucket containing the unzipped Lambda .py source. The publisher
+      uploads `cfn/lambda/handler/*.py` to s3://<pSourceBucket>/<pSourcePrefix>lambda/
+      before deploy. CodeBuild reads from there.
+
+  pSourcePrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional prefix inside the source bucket. If omitted, files are
+      read from s3://<pSourceBucket>/lambda/. Trailing slash recommended.
+
+  pBuildBucket:
+    Type: String
+    Description: >-
+      S3 bucket where CodeBuild writes the zipped Lambda artifact.
+      Must already exist and be writable by the build role.
+
+Resources:
+  # -------------------------------------------------------------------------
+  # CodeBuild project — zips loose .py files into a Lambda deployment zip.
+  # -------------------------------------------------------------------------
+
+  rBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SUSLambdaBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${pSourceBucket}'
+                  - !Sub 'arn:aws:s3:::${pSourceBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${pBuildBucket}/*'
+
+  rBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt rBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: SOURCE_BUCKET
+            Value: !Ref pSourceBucket
+          - Name: SOURCE_PREFIX
+            Value: !Ref pSourcePrefix
+          - Name: BUILD_BUCKET
+            Value: !Ref pBuildBucket
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - set -euo pipefail
+                - mkdir -p /tmp/handler
+                - SRC="s3://${SOURCE_BUCKET}/${SOURCE_PREFIX}lambda/"
+                - echo "Pulling source from ${SRC}"
+                - aws s3 cp "${SRC}" /tmp/handler/ --recursive --exclude "*" --include "*.py"
+                - ls -la /tmp/handler/
+                - cd /tmp/handler
+                - zip -X -q -r /tmp/setup_handler.zip *.py
+                - aws s3 cp /tmp/setup_handler.zip "s3://${BUILD_BUCKET}/setup_handler.zip"
+                - echo "Wrote s3://${BUILD_BUCKET}/setup_handler.zip"
+      TimeoutInMinutes: 10
+
+  # -------------------------------------------------------------------------
+  # Trigger Lambda — inline-ZipFile so it has zero build dependency.
+  # Fires CodeBuild and waits for completion.
+  # -------------------------------------------------------------------------
+
+  rTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SUSTriggerCodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt rBuildProject.Arn
+
+  rTriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 600
+      Role: !GetAtt rTriggerRole.Arn
+      Code:
+        ZipFile: |
+          import json, time, urllib.request, boto3
+          cb = boto3.client('codebuild')
+          def send(event, context, status, reason='', data=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f"see {context.log_stream_name}",
+                  'PhysicalResourceId': event.get('PhysicalResourceId') or context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {},
+              }).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT', headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req, timeout=20).read()
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      return send(event, context, 'SUCCESS')
+                  pid = event['ResourceProperties']['ProjectName']
+                  bid = cb.start_build(projectName=pid)['build']['id']
+                  while True:
+                      b = cb.batch_get_builds(ids=[bid])['builds'][0]
+                      if b.get('buildStatus') in ('SUCCEEDED','FAILED','FAULT','TIMED_OUT','STOPPED'):
+                          break
+                      time.sleep(5)
+                  if b['buildStatus'] != 'SUCCEEDED':
+                      return send(event, context, 'FAILED', f"build {bid} {b['buildStatus']}")
+                  send(event, context, 'SUCCESS', '', {'BuildId': bid})
+              except Exception as e:
+                  send(event, context, 'FAILED', str(e)[:1000])
+
+  # -------------------------------------------------------------------------
+  # Custom Resource — fires the trigger Lambda on stack create/update.
+  # Output is the BuildId returned by the trigger.
+  # -------------------------------------------------------------------------
+
+  rRunBuild:
+    Type: Custom::CodeBuildRun
+    Properties:
+      ServiceToken: !GetAtt rTriggerLambda.Arn
+      ProjectName: !Ref rBuildProject
+      # Re-zips on every stack update (BuildBucket key is fixed,
+      # so an update overwrites the same key). This means a customer
+      # can update the source .py files in S3 and re-deploy the
+      # stack with --force-update-if-no-changes to pick them up.
+      SourceBucket: !Ref pSourceBucket
+      SourcePrefix: !Ref pSourcePrefix
+
+Outputs:
+  oBuildArtifactS3Bucket:
+    Description: S3 bucket where the Lambda zip was written.
+    Value: !Ref pBuildBucket
+  oBuildArtifactS3Key:
+    Description: S3 key of the Lambda zip.
+    Value: setup_handler.zip
+  oBuildId:
+    Description: CodeBuild build id used to produce the artifact.
+    Value: !GetAtt rRunBuild.BuildId

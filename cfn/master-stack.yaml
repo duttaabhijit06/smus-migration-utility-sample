@@ -58,13 +58,9 @@ Parameters:
     Type: String
     Description: S3 bucket name created by the blueprint stack for Tooling.
 
-  pSSOUserID:
-    Type: String
-    Description: IDC user ID (smus-admin) — assigned as project owner + domain unit owner.
-
   pSSOGroupID:
     Type: String
-    Description: IDC group ID (smus-admins) — assigned as domain unit owner.
+    Description: IDC group ID — owns the admin project (PROJECT_OWNER) and the root domain unit. Members of this group inherit project ownership through SMUS's group resolution; no individual SSO user needs to be added.
 
   pSSOInstanceArn:
     Type: String
@@ -74,7 +70,119 @@ Parameters:
     Type: String
     Default: smus-admin
 
+  pLambdaSourceBucket:
+    Type: String
+    Description: >-
+      S3 bucket containing the unzipped Lambda .py source files. The
+      publisher uploads `cfn/lambda/handler/*.py` to
+      `s3://<pLambdaSourceBucket>/<pLambdaSourcePrefix>lambda/` before
+      stack create. The LambdaBuildStack's CodeBuild zips them and
+      writes the result to <ChildStacksBucketName>/setup_handler.zip,
+      which `rSetupHandler` then references as its Code.S3Bucket/Key.
+
+  pLambdaSourcePrefix:
+    Type: String
+    Default: ''
+    Description: >-
+      Optional S3 key prefix inside <pLambdaSourceBucket>. Trailing
+      slash recommended. Default reads from the bucket root.
+
+  # ---------------------------------------------------------------------------
+  # Git repository / connection wiring (managed at the DOMAIN level).
+  #
+  # Per the SageMaker Unified Studio admin guide, Git connections attach
+  # at the domain level (account-scoped CodeConnections resource that
+  # SMUS auto-surfaces on the domain's Connections tab) and are then
+  # enabled per-project by an admin. CodeCommit gets a default
+  # connection from SMUS automatically — we just create the underlying
+  # repository. 3P providers (GitHub, GitLab, Bitbucket) require an
+  # AWS::CodeConnections::Connection that lands in PENDING and must be
+  # authorized once via the AWS console (one-time OAuth handshake).
+  #
+  # Selection rule (driven by the operator's CLI flags via smus-setup.sh):
+  #   * pRepoProvider=CodeCommit (default) and pRepoUrl=='' →
+  #       create AWS::CodeCommit::Repository named pRepoName.
+  #   * pRepoProvider in {GitHub,GitLab,Bitbucket} AND pRepoUrl!='' →
+  #       create AWS::CodeConnections::Connection named pRepoName.
+  #       Operator authorizes once via the URL emitted in the stack
+  #       outputs; no subsequent CFN action required.
+  #
+  # GitHub Enterprise Server / GitLab Self-Managed are NOT supported
+  # via this stack because they require a separate CodeConnections
+  # Host resource that itself needs an OAuth handshake. For those,
+  # operators should pre-create the connection in the AWS console and
+  # pin pRepoConnectionArn (which short-circuits the create here).
+  # ---------------------------------------------------------------------------
+
+  pRepoProvider:
+    Type: String
+    Default: CodeCommit
+    AllowedValues:
+      - CodeCommit
+      - GitHub
+      - GitLab
+      - Bitbucket
+    Description: >-
+      Git provider for the SMUS domain's primary repository connection.
+      Default CodeCommit creates an in-account repository. Any 3P value
+      creates an AWS CodeConnections connection that the operator must
+      authorize once via the AWS console (URL emitted in stack outputs).
+
+  pRepoName:
+    Type: String
+    Default: smus-seed-domain-migration
+    Description: >-
+      Name for the CodeCommit repository (when pRepoProvider=CodeCommit)
+      OR for the AWS CodeConnections connection (when 3P). Used as the
+      logical handle the SMUS portal shows on the domain Connections tab.
+
+  pRepoUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      Repository URL — required for 3P providers (e.g.
+      https://github.com/<org>/<repo>.git), ignored for CodeCommit. For
+      CodeCommit the clone URL is computed from the repo ARN.
+
+  pRepoConnectionArn:
+    Type: String
+    Default: ''
+    Description: >-
+      Pre-existing AWS CodeConnections ARN. When set, this stack
+      DOES NOT create a connection — it only grants the project user
+      role permission to use the supplied ARN. Use this for
+      GitHub Enterprise Server / GitLab Self-Managed (which need a
+      Host resource that's easier to create in the console).
+
+Conditions:
+  # Branch one: in-account CodeCommit repo.
+  cIsCodeCommit: !Equals [!Ref pRepoProvider, 'CodeCommit']
+  # Branch two: 3P provider AND no pre-existing connection ARN —
+  # so this stack creates the connection.
+  cIs3PCreate: !And
+    - !Not [!Equals [!Ref pRepoProvider, 'CodeCommit']]
+    - !Equals [!Ref pRepoConnectionArn, '']
+  # Aggregate: any 3P (whether we create or reuse).
+  cIs3P: !Not [!Equals [!Ref pRepoProvider, 'CodeCommit']]
+  # Operator pinned a pre-existing connection.
+  cReuseConnection: !And
+    - !Not [!Equals [!Ref pRepoProvider, 'CodeCommit']]
+    - !Not [!Equals [!Ref pRepoConnectionArn, '']]
+
 Resources:
+  # -------------------------------------------------------------------------
+  # LambdaBuildStack — zips the loose .py source into a Lambda zip.
+  # Runs in parallel with DomainStack since they're independent.
+  # -------------------------------------------------------------------------
+  LambdaBuildStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${ChildStacksBucketName}.s3.amazonaws.com/sus-lambda-build-stack.yaml
+      Parameters:
+        pSourceBucket: !Ref pLambdaSourceBucket
+        pSourcePrefix: !Ref pLambdaSourcePrefix
+        pBuildBucket: !Ref ChildStacksBucketName
+
   DomainStack:
     Type: AWS::CloudFormation::Stack
     Properties:
@@ -86,7 +194,6 @@ Resources:
         pSUSDomainName: !Ref pSUSDomainName
         pSUSDomainAutomationRolePolicyName: !Ref pSUSDomainAutomationRolePolicyName
         pSSOGroupID: !Ref pSSOGroupID
-        pSSOUserID: !Ref pSSOUserID
         pSSOInstanceArn: !Ref pSSOInstanceArn
 
   BlueprintStack:
@@ -170,9 +277,124 @@ Resources:
         pToolingProjectProfileId: !GetAtt ProjectProfileStack.Outputs.AllCapabilitiesProjectProfileId
         pName: !Ref pAdminProjectName
         pSUSAutomationRoleArn: !GetAtt DomainStack.Outputs.oSUSAutomationRoleArn
-        pSSOUserID: !Ref pSSOUserID
+        pSSOGroupID: !Ref pSSOGroupID
         pSUSProvisioningRoleArn: !GetAtt BlueprintStack.Outputs.oSUSDomainProvisioningRole
         pSUSManagedAccessRoleArn: !GetAtt BlueprintStack.Outputs.oSUSDomainManagedAccessRole
+
+  # ---------------------------------------------------------------------------
+  # Git wiring — created conditionally based on pRepoProvider.
+  #
+  # CodeCommit branch: AWS::CodeCommit::Repository in-account. SMUS
+  # auto-creates a default CodeCommit connection for every domain, so
+  # nothing else is needed — `migrate.sh` later sees the repo by name.
+  #
+  # 3P branch: AWS::CodeConnections::Connection in PENDING state until
+  # the operator authorizes. The Lambda Custom Resource emits the
+  # authorize URL via stack outputs.
+  # ---------------------------------------------------------------------------
+
+  rCodeCommitRepo:
+    Type: AWS::CodeCommit::Repository
+    Condition: cIsCodeCommit
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Ref pRepoName
+      RepositoryDescription: !Sub 'Created by smus-seed CFN stack for ${pSUSDomainName}.'
+
+  r3PConnection:
+    Type: AWS::CodeConnections::Connection
+    Condition: cIs3PCreate
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      ConnectionName: !Ref pRepoName
+      ProviderType: !Ref pRepoProvider
+
+  # ---------------------------------------------------------------------------
+  # Custom Resource setup + teardown — encapsulates the post-deploy AWS CLI
+  # operations that CloudFormation can't model directly (LF grants on
+  # pre-existing seed Glue, KMS key policy on dynamic project user role,
+  # IAM inlines on dynamic role, WithFederation S3 re-registration, plus
+  # the 9 hardening passes for delete).
+  #
+  # Code lives in cfn/lambda/handler/. `smus-setup.sh` runs the build
+  # script before deploy, which zips the handler and uploads it to
+  # ${ChildStacksBucketName}/setup_handler.zip alongside the templates.
+  #
+  # Execution role: re-uses `rSUSAutomationRole` (in sus-domain-stack.yaml).
+  # That role is already trusted by lambda.amazonaws.com, registered as
+  # a DataZone domain owner, and (per our edits to rSUSAutomationRolePolicy)
+  # carries every IAM/LF/Glue/KMS/EC2/S3/datazone permission the handler
+  # needs. Reusing it keeps the IAM surface in one place.
+  # ---------------------------------------------------------------------------
+
+  rSetupHandler:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - DomainStack
+      - LambdaBuildStack
+    Properties:
+      Handler: handler.handler
+      Runtime: python3.12
+      Timeout: 900           # 15-min hard limit
+      MemorySize: 512
+      Role: !GetAtt DomainStack.Outputs.oSUSAutomationRoleArn
+      Code:
+        S3Bucket: !GetAtt LambdaBuildStack.Outputs.oBuildArtifactS3Bucket
+        S3Key: !GetAtt LambdaBuildStack.Outputs.oBuildArtifactS3Key
+      Description: SMUS post-deploy setup + pre-delete teardown handler.
+
+  # rPostDeploy fires on stack Create/Update; depends on every nested
+  # stack so it's the LAST thing to run during create. Its inverse —
+  # `rPreDelete` — has NO DependsOn, so CFN deletes it FIRST during
+  # stack delete (and the rest of the stack waits on its SUCCESS).
+  rPostDeploy:
+    Type: Custom::SUSPostDeploy
+    DependsOn:
+      - DomainStack
+      - BlueprintStack
+      - ProjectProfileStack
+      - PolicyGrantStack
+      - ProjectStack
+    Properties:
+      ServiceToken: !GetAtt rSetupHandler.Arn
+      Action: setup
+      Region: !Ref AWS::Region
+      DomainId: !GetAtt DomainStack.Outputs.oSUSDomainID
+      AdminProjectId: !GetAtt ProjectStack.Outputs.oAdminProjectId
+      LFRegistrationRoleArn: !GetAtt DomainStack.Outputs.oSUSLFRegistrationRoleArn
+      ManageAccessRoleArn: !GetAtt BlueprintStack.Outputs.oSUSDomainManagedAccessRole
+      ToolingBucketName: !Ref pSUSBPToolingBucketName
+      RepoProvider: !Ref pRepoProvider
+      RepoName: !Ref pRepoName
+      # Pass the resolved CodeCommit ARN when CodeCommit was created
+      # here, otherwise empty. The Lambda uses this to scope the
+      # `codecommit:GitPull/GitPush` grant on the project user role.
+      CodeCommitRepoArn:
+        !If [cIsCodeCommit, !GetAtt rCodeCommitRepo.Arn, '']
+      # Connection ARN (either the one we created or a pre-existing
+      # one the operator pinned). Empty for CodeCommit. Lambda uses
+      # this to scope the `codeconnections:UseConnection` grant on
+      # the project user role and to emit the authorize-URL output.
+      ConnectionArn: !If
+        - cIs3PCreate
+        - !Ref r3PConnection
+        - !If
+          - cReuseConnection
+          - !Ref pRepoConnectionArn
+          - ''
+      RepoUrl: !Ref pRepoUrl
+
+  rPreDelete:
+    Type: Custom::SUSPreDelete
+    Properties:
+      ServiceToken: !GetAtt rSetupHandler.Arn
+      Action: teardown
+      Region: !Ref AWS::Region
+      DomainId: !GetAtt DomainStack.Outputs.oSUSDomainID
+      AdminProjectId: !GetAtt ProjectStack.Outputs.oAdminProjectId
+
 
 Outputs:
   oSUSDomainID:
@@ -199,3 +421,38 @@ Outputs:
 
   oAdminProjectName:
     Value: !GetAtt ProjectStack.Outputs.oAdminProjectName
+
+  # ---- Git repository / connection wiring ---------------------------------
+  oRepoProvider:
+    Description: 'Git provider for the domain (CodeCommit | GitHub | GitLab | Bitbucket).'
+    Value: !Ref pRepoProvider
+
+  oRepoName:
+    Description: 'Repository or connection name as shown in the SMUS domain Connections tab.'
+    Value: !Ref pRepoName
+
+  oCodeCommitRepoArn:
+    Description: 'ARN of the in-account CodeCommit repository (empty when 3P).'
+    Condition: cIsCodeCommit
+    Value: !GetAtt rCodeCommitRepo.Arn
+
+  oCodeCommitCloneUrlHttp:
+    Description: 'HTTPS clone URL for CodeCommit (empty when 3P).'
+    Condition: cIsCodeCommit
+    Value: !GetAtt rCodeCommitRepo.CloneUrlHttp
+
+  oRepoConnectionArn:
+    Description: 'CodeConnections ARN — either created here or operator-pinned (empty for CodeCommit).'
+    Condition: cIs3P
+    Value: !If
+      - cIs3PCreate
+      - !Ref r3PConnection
+      - !Ref pRepoConnectionArn
+
+  oRepoConnectionAuthorizeUrl:
+    Description: >-
+      ACTION REQUIRED for 3P providers: open this URL once in the AWS
+      console to complete the OAuth handshake. Until done, the
+      connection state is PENDING and Git pulls fail.
+    Condition: cIs3PCreate
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/codesuite/settings/connections'

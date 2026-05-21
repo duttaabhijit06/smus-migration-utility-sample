@@ -21,8 +21,8 @@ Parameters:
   pSUSAutomationRoleArn:
     Description: SUS Automation Role ARN
     Type: String
-  pSSOUserID:
-    Description: SSO User ID to be added as Project Owner
+  pSSOGroupID:
+    Description: SSO Group ID to be added as Project Owner
     Type: String
   pSUSProvisioningRoleArn:
     Type: String
@@ -34,6 +34,27 @@ Parameters:
 Resources:
   rAddDataLakeAdministratorToLakeFormation:
     Type: AWS::LakeFormation::DataLakeSettings
+    # On stack delete, the project sub-stack deletes mid-flight the
+    # dynamic project user role (`datazone_usr_role_<projectId>_<envId>`)
+    # that LF tracks as a data-lake admin. By the time CFN's Delete
+    # handler for THIS DataLakeSettings row runs (~4 min after the
+    # rPreDelete Lambda), that role has been removed by SMUS — leaving
+    # a fresh dangling principal in the admins list that the handler
+    # can't re-write cleanly. The rPreDelete Lambda's Pass F already
+    # pre-strips the dynamic role, but the SMUS-managed access /
+    # provisioning roles configured here can also race their own
+    # deletes when Resource Sharing is involved.
+    #
+    # Setting `Retain` is safe because:
+    #   * The parent `delete-stack` is tearing down the whole domain
+    #     anyway — there's no LF state worth preserving.
+    #   * The rPreDelete Lambda's Pass F runs `put-data-lake-settings`
+    #     with a clean DataLakeAdmins list (with all dangling and
+    #     about-to-be-dangling principals stripped) — so the LF state
+    #     left behind on the AWS side is consistent regardless of what
+    #     this CFN row tried to do.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Admins:
         - DataLakePrincipalIdentifier: !Ref pSUSManagedAccessRoleArn
@@ -48,13 +69,13 @@ Resources:
       Name: !Ref pName
       ProjectProfileId: !Ref pToolingProjectProfileId
 
-  rAddSSOUserToProjectMembership:
+  rAddSSOGroupToProjectMembership:
     Type: AWS::DataZone::ProjectMembership
     Properties:
       DomainIdentifier: !Ref pSUSDomainid
       ProjectIdentifier: !GetAtt rProject.Id
       Member:
-        UserIdentifier: !Ref pSSOUserID
+        GroupIdentifier: !Ref pSSOGroupID
       Designation: "PROJECT_OWNER"
 
   rAddSUSAutomationRoleToProjectMembership:

@@ -21,9 +21,6 @@ Parameters:
   pSUSDomainAutomationRolePolicyName:
     Type: String
     Description: Name of Automation role policy
-  pSSOUserID:
-    Type: String
-    Description: SSO User ID to be added as Project Owner
   pSSOGroupID:
     Type: String
     Description: SSO Group ID to be added as Domain Unit Owner
@@ -82,6 +79,18 @@ Resources:
               - datazone:TagResource
               - datazone:GetDomain
               - datazone:GetDomainUnit
+              - datazone:ListDomains
+              # Setup + teardown helpers (rPostDeploy, rPreDelete) need
+              # these to discover the project user role + drain envs.
+              - datazone:GetProject
+              - datazone:ListProjects
+              - datazone:DeleteProject
+              - datazone:ListEnvironments
+              - datazone:GetEnvironment
+              - datazone:DeleteEnvironment
+              - datazone:ListSubscriptions
+              - datazone:CancelSubscription
+              - datazone:RevokeSubscription
             Resource:
               - !Sub 'arn:aws:datazone:${AWS::Region}:${AWS::AccountId}:domain/*'
           - Sid: domainkey
@@ -93,6 +102,13 @@ Resources:
               - kms:CreateGrant
             Resource:
               - !GetAtt rSUSDomainKMSKey.Arn
+          - Sid: ToolingKMSPolicyMutation
+            Effect: Allow
+            Action:
+              - kms:DescribeKey
+              - kms:GetKeyPolicy
+              - kms:PutKeyPolicy
+            Resource: '*'
           - Sid: IAM
             Effect: Allow
             Action:
@@ -109,15 +125,116 @@ Resources:
               - sso:PutApplicationGrant
               - sso:PutApplicationAuthenticationMethod
               - sso:PutApplicationAccessScope
+              - sso-admin:ListInstances
+              - identitystore:DescribeGroup
+              - identitystore:GetGroupId
+              - identitystore:ListGroups
             Resource:
               - 'arn:aws:sso:::instance/*'
               - 'arn:aws:sso::aws:applicationProvider/*'
               - 'arn:aws:sso::*:application/*/*'
+              - '*'
           - Sid: IAMRoleAccess
             Effect: Allow
             Action:
               - iam:GetRole
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
             Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/*
+          - Sid: ProjectUserRoleInlineMutation
+            Effect: Allow
+            Action:
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+            Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/datazone_usr_role_*'
+          - Sid: LakeFormationMutations
+            Effect: Allow
+            Action:
+              - lakeformation:GetDataLakeSettings
+              - lakeformation:PutDataLakeSettings
+              - lakeformation:GrantPermissions
+              - lakeformation:RevokePermissions
+              - lakeformation:RegisterResource
+              - lakeformation:DeregisterResource
+              - lakeformation:ListResources
+              - lakeformation:DescribeResource
+            Resource: '*'
+          - Sid: GlueCatalogWalk
+            Effect: Allow
+            Action:
+              - glue:GetDatabase
+              - glue:GetDatabases
+              - glue:GetTable
+              - glue:GetTables
+              - glue:UpdateDatabase
+              - glue:DeleteDatabase
+              - glue:DeleteTable
+            Resource: '*'
+          - Sid: ToolingBucketAccess
+            Effect: Allow
+            Action:
+              - s3:GetEncryptionConfiguration
+              - s3:ListBucket
+              - s3:ListBucketVersions
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:DeleteBucket
+              - s3:GetObject
+              - s3:GetBucketTagging
+            Resource:
+              - !Sub 'arn:aws:s3:::amazon-datazone-tooling-${AWS::AccountId}-*'
+              - !Sub 'arn:aws:s3:::amazon-datazone-tooling-${AWS::AccountId}-*/*'
+          - Sid: TeardownEC2
+            Effect: Allow
+            Action:
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeVpcEndpoints
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSecurityGroupRules
+              - ec2:DetachNetworkInterface
+              - ec2:DeleteNetworkInterface
+              - ec2:DeleteVpcEndpoints
+              - ec2:RevokeSecurityGroupIngress
+            Resource: '*'
+          - Sid: TeardownAthena
+            # Pass A2 of the rPreDelete Lambda terminates active
+            # Athena Spark sessions on the project's workgroup. SMUS
+            # provisions the workgroup with the well-known name
+            # `sagemaker-studio-spark-workgroup-<projectId>` inside
+            # its own DataZone-Env-* nested stack. Without this,
+            # active sessions block the workgroup delete and cascade
+            # into a DELETE_FAILED on the parent project.
+            Effect: Allow
+            Action:
+              - athena:ListWorkGroups
+              - athena:ListSessions
+              - athena:TerminateSession
+            Resource: '*'
+          - Sid: STS
+            Effect: Allow
+            Action: sts:GetCallerIdentity
+            Resource: '*'
+          - Sid: CodeConnectionsRead
+            # Read-only describe for the connection so the post-deploy
+            # Lambda can surface the live ConnectionStatus (PENDING /
+            # AVAILABLE / ERROR) in the CR Data without needing to
+            # mutate anything. Connection mutation is handled by CFN
+            # itself (AWS::CodeConnections::Connection resource).
+            Effect: Allow
+            Action:
+              - codeconnections:GetConnection
+              - codeconnections:ListConnections
+              - codestar-connections:GetConnection
+              - codestar-connections:ListConnections
+            Resource: '*'
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
 
   rSUSAutomationRole:
     Type: AWS::IAM::Role
@@ -158,6 +275,7 @@ Resources:
       AssumeRolePolicyDocument:
         Version: 2012-10-17
         Statement:
+          # DataZone control plane (V2 domain create + maintenance).
           - Effect: Allow
             Principal:
               Service: datazone.amazonaws.com
@@ -171,8 +289,16 @@ Resources:
               ForAllValues:StringLike:
                 aws:TagKeys:
                   - 'datazone*'
+          # SageMaker control plane (Studio environment provisioning).
+          # Required by step 01_create-smus-domain when the orchestrator
+          # falls back to the well-known role name.
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/SageMakerStudioDomainExecutionRolePolicy
+        - arn:aws:iam::aws:policy/AmazonDataZoneFullAccess
         - !Ref rSUSDomainExecutionRoleKMSPolicy
 
   rSUSDomainServiceRole:
@@ -193,6 +319,123 @@ Resources:
                 aws:SourceAccount: !Ref 'AWS::AccountId'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/SageMakerStudioDomainServiceRolePolicy
+
+  # ---------------------------------------------------------------------------
+  # rSUSToolingProvisioningRole
+  #
+  # Tooling-blueprint provisioning role. DataZone (and the CFN sub-stacks
+  # it creates per environment) assumes this role to provision compute,
+  # storage, and IAM artifacts for project environments.
+  #
+  # Trust:  datazone.amazonaws.com + cloudformation.amazonaws.com
+  # Permissions: AmazonDataZoneSageMakerProvisioningRolePolicy + AdministratorAccess.
+  #
+  # The AdministratorAccess attachment matches the stock SMUS All-capabilities
+  # blueprint expectation; it can be tightened by replacing it with a
+  # scoped policy if your account requires it.
+  # ---------------------------------------------------------------------------
+  rSUSToolingProvisioningRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: sagemaker-studio-provisioning-role
+      Description: SageMaker Unified Studio Tooling provisioning role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: datazone.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonDataZoneSageMakerProvisioningRolePolicy
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # ---------------------------------------------------------------------------
+  # rSUSProjectsBucket
+  #
+  # SMUS scans for buckets prefixed `amazon-datazone-projects-` to use as
+  # project-asset storage. The Tooling bucket (in sus-blueprints-stack.yaml)
+  # is the primary; this one matches the secondary discovery token used by
+  # some downstream blueprints.
+  # ---------------------------------------------------------------------------
+  rSUSProjectsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub 'amazon-datazone-projects-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ---------------------------------------------------------------------------
+  # rSUSLFRegistrationRole
+  #
+  # Lake Formation needs a dedicated IAM role to act as the data-access
+  # principal for S3 prefix registrations that use --with-federation
+  # --hybrid-access-enabled. Without this role, Athena Spark workgroups
+  # cannot vend per-table credentials for tables backed by external
+  # (seed) S3 buckets.
+  #
+  # Used by `_smus_session_bootstrap` in smus-setup.sh which loops over
+  # every external Glue DB, takes the unique set of S3 prefixes, and
+  # re-registers each with this role as the registration principal.
+  #
+  # Trust:  lakeformation.amazonaws.com + glue.amazonaws.com
+  # Permissions: read source S3 buckets + GetTable/GetDatabase + LF data
+  #              access. Resource scope is "*" because the helper rotates
+  #              through any number of seed buckets and we don't know
+  #              their names at deploy time.
+  # ---------------------------------------------------------------------------
+  rSUSLFRegistrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: smus-seed-lf-registration-role
+      Description: Data-access role used by Lake Formation to register source S3 prefixes with WithFederation=true.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lakeformation.amazonaws.com
+                - glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LFRegistrationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3DataAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketAcl
+                Resource: '*'
+              - Sid: GlueAccess
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                Resource: '*'
+              - Sid: LakeFormationDataAccess
+                Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                  - lakeformation:GrantPermissions
+                Resource: '*'
 
   rSUSDomain:
     Type: AWS::DataZone::Domain
@@ -217,31 +460,21 @@ Resources:
       UserType: IAM_ROLE
       Status: ASSIGNED
 
-  rSSOUserProfile:
-    Type: AWS::DataZone::UserProfile
-    DependsOn: rSUSDomain
-    Properties:
-      DomainIdentifier: !Ref rSUSDomain
-      UserIdentifier: !Ref pSSOUserID
-      UserType: SSO_USER
-      Status: ASSIGNED
-
-  rSUSDomainOwnerSSOUser:
-    Type: AWS::DataZone::Owner
-    DependsOn:
-      - rSSOUserProfile
-      - rSUSDomain
-    Properties:
-      DomainIdentifier: !Ref rSUSDomain
-      EntityIdentifier: !GetAtt rSUSDomain.RootDomainUnitId
-      EntityType: DOMAIN_UNIT
-      Owner:
-        User:
-          UserIdentifier: !Ref pSSOUserID
-
   rSUSDomainOwnerIAMRole:
     Type: AWS::DataZone::Owner
     DependsOn: rSUSAutomationRoleProfile
+    # On stack delete, DataZone has *already* removed this owner
+    # reference as part of its cascading domain teardown by the time
+    # CFN's Delete handler fires. The handler then hits a 409
+    # ConditionalCheckFailed and fails the stack. `Retain` tells CFN
+    # to skip the Delete API call. Safe because the parent
+    # `rSUSDomain` delete cascades all owner references on the
+    # DataZone side, so nothing is orphaned in AWS — only CFN's
+    # tracking row is dropped (which is fine because the entire stack
+    # is being torn down). See the README "Common gotchas" entry on
+    # the legacy `--retain-resources` workaround that this replaces.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       DomainIdentifier: !Ref rSUSDomain
       EntityIdentifier: !GetAtt rSUSDomain.RootDomainUnitId
@@ -260,6 +493,11 @@ Resources:
   rSUSDomainOwnerSSOGroup:
     Type: AWS::DataZone::Owner
     DependsOn: rSUSGroupProfile
+    # Same race + same fix as rSUSDomainOwnerIAMRole above. SMUS
+    # removes the SSO-group owner reference as part of cascading
+    # domain teardown before CFN's Delete handler runs.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       DomainIdentifier: !Ref rSUSDomain
       EntityIdentifier: !GetAtt rSUSDomain.RootDomainUnitId
@@ -293,3 +531,18 @@ Outputs:
   oSUSAutomationRoleName:
     Description: Name of the SUS Automation Role.
     Value: !Ref pSUSAutomationRoleName
+  oSUSLFRegistrationRoleArn:
+    Description: ARN of the dedicated Lake Formation registration role used by smus-setup.sh for WithFederation re-registration of source S3 prefixes.
+    Value: !GetAtt rSUSLFRegistrationRole.Arn
+  oSUSLFRegistrationRoleName:
+    Description: Name of the LF registration role.
+    Value: !Ref rSUSLFRegistrationRole
+  oSUSToolingProvisioningRoleArn:
+    Description: ARN of the Tooling provisioning role.
+    Value: !GetAtt rSUSToolingProvisioningRole.Arn
+  oSUSToolingProvisioningRoleName:
+    Description: Name of the Tooling provisioning role.
+    Value: !Ref rSUSToolingProvisioningRole
+  oSUSProjectsBucketName:
+    Description: Name of the projects bucket scanned by SMUS for asset storage.
+    Value: !Ref rSUSProjectsBucket
