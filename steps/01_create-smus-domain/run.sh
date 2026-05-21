@@ -383,51 +383,59 @@ if mt_apply_mode && [ -n "$DOMAIN_ID" ] && [ -n "$PROJECT_ID" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# Phase 3 — Repository (CodeCommit auto-create or external provider URL).
+# Phase 3 — Repository discovery (DISCOVERY-ONLY since smus-setup CFN took over).
+#
+# As of the 2026-Q2 refactor, the SMUS CFN stack (smus-setup.sh) owns
+# both the in-account CodeCommit repository (when repo_provider=CodeCommit)
+# and the AWS CodeConnections connection (3P providers). The migration
+# tool no longer creates either — it just reads them so downstream
+# steps can include `repo_url` / `codecommit_repo_arn` /
+# `git_connection_id` in the state stream.
+#
+# Discovery happens against the persisted smus-setup config first
+# (config/smus-setup.config.json), then falls back to live AWS
+# discovery for resilience.
+# -----------------------------------------------------------------------------
 REPO_ARN=""
 REPO_CLONE_URL=""
 
+# Read smus-setup's config first — this is the canonical source of
+# truth populated by `_surface_repo_info`.
+_SETUP_CFG="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/config/smus-setup.config.json"
+if [ -f "$_SETUP_CFG" ] && command -v jq >/dev/null 2>&1; then
+    REPO_ARN="$(jq -r '.codecommit_repo_arn // empty' "$_SETUP_CFG" 2>/dev/null)"
+    REPO_CLONE_URL="$(jq -r '.repo_url // empty' "$_SETUP_CFG" 2>/dev/null)"
+fi
+
 case "$MT_REPO_PROVIDER" in
     codecommit)
-        # 3a. Idempotent CodeCommit_Repo. In apply mode we try
-        #     `aws codecommit get-repository` first; a non-zero exit is
-        #     treated as a 404 and we fall through to create. In dry-
-        #     run we print both would-be commands via mt_dryrun and
-        #     synthesise placeholder URL/ARN values so downstream
-        #     phases run end-to-end.
+        # 3a. Discovery only. The SMUS CFN stack owns repo creation
+        # now; if `config/smus-setup.config.json` already supplied
+        # `repo_url` / `codecommit_repo_arn` we use those. Otherwise
+        # fall back to a `get-repository` lookup (handles BYOD mode
+        # where smus-setup didn't run, or older clones predating the
+        # refactor).
         if mt_apply_mode; then
-            REPO_GET_OUT=""
-            if REPO_GET_OUT=$(aws codecommit get-repository \
-                    --repository-name "$MT_REPO_NAME" \
-                    --region "$MT_AWS_REGION" 2>/dev/null); then
-                REPO_CLONE_URL=$(printf '%s\n' "$REPO_GET_OUT" \
-                    | _extract_id repositoryMetadata.cloneUrlHttp)
-                REPO_ARN=$(printf '%s\n' "$REPO_GET_OUT" \
-                    | _extract_id repositoryMetadata.Arn)
-            fi
-
             if [ -z "$REPO_CLONE_URL" ] || [ -z "$REPO_ARN" ]; then
-                REPO_CREATE_OUT=$(mt_aws codecommit create-repository \
-                    --repository-name "$MT_REPO_NAME" \
-                    --region "$MT_AWS_REGION" 2>&1 || true)
-                printf '%s\n' "$REPO_CREATE_OUT" | _replay_status
-                REPO_CLONE_URL=$(printf '%s\n' "$REPO_CREATE_OUT" \
-                    | _strip_status \
-                    | _extract_id repositoryMetadata.cloneUrlHttp)
-                REPO_ARN=$(printf '%s\n' "$REPO_CREATE_OUT" \
-                    | _strip_status \
-                    | _extract_id repositoryMetadata.Arn)
-                if [ -z "$REPO_CLONE_URL" ] || [ -z "$REPO_ARN" ]; then
-                    mt_status error "failed to parse cloneUrlHttp/Arn from create-repository output"
-                    printf '%s\n' "$REPO_CREATE_OUT"
-                    exit 1
+                REPO_GET_OUT=""
+                if REPO_GET_OUT=$(aws codecommit get-repository \
+                        --repository-name "$MT_REPO_NAME" \
+                        --region "$MT_AWS_REGION" 2>/dev/null); then
+                    [ -z "$REPO_CLONE_URL" ] && REPO_CLONE_URL=$(printf '%s\n' "$REPO_GET_OUT" \
+                        | _extract_id repositoryMetadata.cloneUrlHttp)
+                    [ -z "$REPO_ARN" ] && REPO_ARN=$(printf '%s\n' "$REPO_GET_OUT" \
+                        | _extract_id repositoryMetadata.Arn)
                 fi
+            fi
+            if [ -z "$REPO_CLONE_URL" ] || [ -z "$REPO_ARN" ]; then
+                mt_status error "CodeCommit repo '${MT_REPO_NAME}' not found and migration tool no longer creates it"
+                mt_status error "Run \`./scripts/smus-setup.sh setup --apply\` first (it creates the repo via CFN)."
+                exit 1
             fi
         else
             mt_dryrun "aws codecommit get-repository --repository-name ${MT_REPO_NAME} --region ${MT_AWS_REGION}"
-            mt_dryrun "aws codecommit create-repository --repository-name ${MT_REPO_NAME} --region ${MT_AWS_REGION}"
-            REPO_CLONE_URL="https://git-codecommit.${MT_AWS_REGION}.amazonaws.com/v1/repos/${MT_REPO_NAME}"
-            REPO_ARN="arn:aws:codecommit:${MT_AWS_REGION}:${MT_SOURCE_ACCOUNT_ID:-000000000000}:${MT_REPO_NAME}"
+            [ -z "$REPO_CLONE_URL" ] && REPO_CLONE_URL="https://git-codecommit.${MT_AWS_REGION}.amazonaws.com/v1/repos/${MT_REPO_NAME}"
+            [ -z "$REPO_ARN" ] && REPO_ARN="arn:aws:codecommit:${MT_AWS_REGION}:${MT_SOURCE_ACCOUNT_ID:-000000000000}:${MT_REPO_NAME}"
         fi
 
         mt_status set "repo_url=${REPO_CLONE_URL}"
@@ -446,22 +454,23 @@ esac
 
 # -----------------------------------------------------------------------------
 # -----------------------------------------------------------------------------
-# Phase 4 — Git connection on the Admin_Project (idempotent create).
+# Phase 4 — Git connection discovery (DISCOVERY-ONLY since smus-setup CFN took over).
+#
+# As of the 2026-Q2 refactor, the SMUS CFN stack creates the
+# AWS::CodeConnections::Connection (3P providers) or relies on SMUS's
+# default CodeCommit connection. This step reads the connection ARN
+# from `config/smus-setup.config.json` (populated by smus-setup) or
+# from the operator's `--set git_connection_id=<arn>` override.
 #
 # IMPORTANT — DataZone V2 API change:
 # Earlier DataZone CLI versions accepted `aws datazone create-connection
 # --type GIT --props <providerProperties>` for binding a Git provider
 # to a project. The V2 CLI (post-2024) restricts `create-connection`'s
 # `props` to data-source types only (athena, glue, redshift, s3, ...);
-# Git providers are now configured via AWS CodeConnections (formerly
-# AWS CodeStar Connections) at the AWS account level rather than on
-# the DataZone project.
-#
-# For CodeCommit, no AWS CodeConnections connection is needed — the
-# repository ARN suffices for downstream steps (Step 3 etc.). For
-# external Git providers (github, gitlab, bitbucket), an AWS
-# CodeConnections connection must already exist; pass its ARN via
-# `--set git_connection_id=<arn>` to skip creation here.
+# Git providers are now configured via AWS CodeConnections (account-level
+# OAuth) rather than on the DataZone project. This step therefore does
+# NOT mutate DataZone — it just records the binding for state-stream
+# consumers.
 
 case "$MT_REPO_PROVIDER" in
     codecommit)
@@ -472,10 +481,19 @@ case "$MT_REPO_PROVIDER" in
         ;;
 esac
 
+# Resolution priority for the connection ID:
+#   1. --set git_connection_id=<arn> on the migrate.sh command line
+#   2. config/smus-setup.config.json `repo_connection_arn`
+#   3. for codecommit: synthetic id based on repo name (no real ARN needed)
+#   4. for 3P: hard error — operator must run smus-setup or pass --set
 GIT_CONNECTION_ID="${MT_GIT_CONNECTION_ID:-}"
 
+if [ -z "$GIT_CONNECTION_ID" ] && [ -f "$_SETUP_CFG" ] && command -v jq >/dev/null 2>&1; then
+    GIT_CONNECTION_ID="$(jq -r '.repo_connection_arn // empty' "$_SETUP_CFG" 2>/dev/null)"
+fi
+
 if [ -n "$GIT_CONNECTION_ID" ]; then
-    mt_status action "git_connection_id provided; skipping create-connection"
+    mt_status action "git_connection_id resolved (from --set or smus-setup.config.json): ${GIT_CONNECTION_ID}"
 elif [ "$MT_REPO_PROVIDER" = "codecommit" ]; then
     # CodeCommit doesn't need a CodeConnections connection — Step 3 and
     # later use the repository ARN directly. Persist a synthetic ID so
@@ -483,7 +501,9 @@ elif [ "$MT_REPO_PROVIDER" = "codecommit" ]; then
     GIT_CONNECTION_ID="codecommit-${MT_REPO_NAME}"
     mt_status action "codecommit-direct-binding; no AWS CodeConnections connection needed"
 else
-    mt_status error "external Git provider '${MT_REPO_PROVIDER}' requires an AWS CodeConnections connection ARN passed via --set git_connection_id=<arn>"
+    mt_status error "external Git provider '${MT_REPO_PROVIDER}' requires a CodeConnections ARN."
+    mt_status error "Either run \`./scripts/smus-setup.sh setup --apply --repo-provider <provider> --repo-url <url>\`"
+    mt_status error "(which creates the connection via CFN), or pass --set git_connection_id=<arn> for a pre-existing one."
     exit 1
 fi
 
