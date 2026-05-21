@@ -174,6 +174,16 @@ def build_parser() -> argparse.ArgumentParser:
         dest="convert_dags",
         help="Include Step 8 (Python DAG to YAML conversion).",
     )
+    parser.add_argument(
+        "--push-cicd",
+        action="store_true",
+        default=False,
+        dest="push_cicd",
+        help=(
+            "Include Step 9 (CI/CD pipeline file generation + git push). "
+            "Requires local Git credentials for 3P providers — see README."
+        ),
+    )
 
     return parser
 
@@ -209,6 +219,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     * ``reconfigure: bool``
     * ``set_overrides: list[tuple[str, str]]``
     * ``convert_dags: bool``
+    * ``push_cicd: bool``
 
     Args:
         argv: optional argument vector. Defaults to ``sys.argv[1:]``

@@ -58,6 +58,16 @@ _STATE_PATH = pathlib.Path("state/migration.state.json")
 # The canonical Step 8 ID, gated behind ``--convert-dags``.
 _STEP_8_ID = "08_dag-yaml"
 
+# The canonical Step 9 ID, gated behind ``--push-cicd``. Step 9
+# generates the CI/CD pipeline file and (for non-CodeCommit providers)
+# tries to ``git push`` to the configured repo. Pushing to GitHub /
+# GitLab / Bitbucket needs local Git credentials (PAT, SSH key,
+# ``gh auth``) — AWS CodeConnections does not authenticate local
+# pushes. We make 09 opt-in for 3P providers so a default
+# ``./scripts/migrate.sh run --apply`` doesn't fail at the last
+# step on operators who don't have local Git auth set up.
+_STEP_9_ID = "09_cicd"
+
 # Cap on mid-run prompt retries. After this many ConfigError-driven
 # retries in a row, the orchestrator gives up and exits non-zero.
 _MAX_PROMPT_RETRIES = 5
@@ -97,6 +107,16 @@ def _resolve_subset(args) -> list[str]:
         print(
             f"Note: Step {_STEP_8_ID} was skipped. "
             "Pass --convert-dags to include it."
+        )
+
+    # Step 9 gate: drop ``09_cicd`` unless --push-cicd was passed.
+    # See the comment on _STEP_9_ID for why.
+    if _STEP_9_ID in subset and not args.push_cicd:
+        subset = [step_id for step_id in subset if step_id != _STEP_9_ID]
+        print(
+            f"Note: Step {_STEP_9_ID} was skipped. "
+            "Pass --push-cicd to include it (requires local Git credentials "
+            "for 3P providers — see README 'Step 9 prerequisites')."
         )
 
     return subset

@@ -1,360 +1,621 @@
 # SageMaker Unified Studio Migration Toolkit
 
-A complete toolkit for migrating an existing AWS analytics estate into [Amazon SageMaker Unified Studio (SMUS)](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/) — domain creation, Glue jobs, Glue Data Catalog assets, S3 data, MWAA DAGs, and CI/CD wiring — with a paired sandbox provisioner for end-to-end testing in a clean account.
+A learning sample for migrating analytics workloads into [Amazon SageMaker Unified Studio (SMUS)](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/). Read the scripts, run them in a test account, and copy the patterns into your own tooling.
 
-## Objective
+---
 
-Bring an account's analytics surface (Glue, S3 data, MWAA, Lake Formation, related connectivity) into a governed SMUS domain in one repeatable run, while preserving the original IAM identities, scripts, and DAGs as code under your own version control.
+## How it works in 30 seconds
 
-> **This toolkit is a reference sample, not a turnkey product.** It's intended to help you learn how SMUS migration works end-to-end and to plan your own migration — read the scripts, run them against a sandbox account, adapt the per-step bash to your real source estate, and lift the patterns into your own tooling. Treat the bootstraps and step scripts as worked examples of the AWS API calls, IAM/LF/KMS configuration, and SMUS-specific gotchas you'll encounter, not as a black box to point at production.
+You run four scripts in order:
 
-## Why this matters
+```bash
+./scripts/seed.sh provision --apply --profile <aws-profile> --yes      # 1. fake source data
+./scripts/smus-setup.sh setup --apply --profile <aws-profile> --yes    # 2. build the SMUS domain
+./scripts/migrate.sh run --apply --profile <aws-profile> --yes         # 3. migrate into SMUS
+# ... use SMUS, tear down when done ...
+./scripts/migrate.sh teardown --apply --profile <aws-profile> --yes    # 4. unwind migration
+./scripts/smus-setup.sh teardown --apply --profile <aws-profile> --yes # 5. tear down SMUS
+./scripts/nuke.sh --apply --profile <aws-profile> --yes                # 6. wipe fake source data
+```
 
-If you already run analytics on AWS today, lifting it into SMUS by hand is a multi-week ticket-driven exercise: domain bootstrap, project profiles, blueprints, IDC wiring, Glue catalog publishing, Lake Formation grants, MWAA migration, CodeCommit/GitHub plumbing, and Spark session compatibility — every one with its own gotchas. This toolkit collapses that into a deterministic apply-mode run.
+Each script defaults to dry-run. Pass `--apply` to actually do things.
 
-It helps customers who want to:
+---
 
-- **Adopt SMUS without re-platforming.** External Glue jobs, S3 buckets, MWAA DAGs, and Glue connections are migrated as data assets and code, not rewritten.
-- **Get governed access in one pass.** Lake Formation hybrid mode, IAMAllowedPrincipals cleanup, project user role grants (Describe/Select +Grantable), manage-access role grants, KMS key access for Spark logs, and self-subscription to Glue assets all happen in one bootstrap chain.
-- **Test the migration before doing it for real.** A paired Seed Script provisions a representative source account (Glue, RDS, MSK, Kinesis, Firehose, SNS, Lambda, CloudWatch, MWAA) so you can rehearse the whole thing in dev before pointing it at production.
-- **Tear it all down and start over.** Hardened teardown handles the five known SMUS deletion failure modes (lingering VPC endpoints, cross-SG ingress rules, env stack drain, dangling LF admins, stuck DataZone Owner CFN resource) so you can iterate without manual EC2 / IAM / LF cleanup.
+## What you need before you start
 
-## What's in the box
+1. **AWS account** you can experiment in (don't use production).
+2. **AWS CLI** installed and configured with credentials.
+3. **Python 3.12** with virtualenv: `python3 -m venv .venv && .venv/bin/pip install -e .`
+4. **`jq`** installed (`brew install jq` or `apt-get install jq`).
+5. **AWS Identity Center (IDC) enabled** in your target region — open the IAM Identity Center console once and click "Enable" if it isn't already.
 
-There are four entry-point scripts. Two stand up source-side data; two move it into SMUS.
+---
 
-| Script | Purpose |
+## Layout
+
+```
+scripts/
+  ├── seed.sh               # creates fake source data
+  ├── smus-setup.sh         # builds the SMUS domain via CloudFormation
+  ├── migrate.sh            # runs the 9-step migration
+  ├── add-glue-databases.sh # adds Glue databases to the admin project (post-migration)
+  └── nuke.sh               # wipes the fake source data
+
+cfn/                  # CloudFormation templates the setup script deploys
+  ├── master-stack.yaml
+  ├── child-stacks/   # 6 child templates
+  ├── lambda/handler/ # Lambda Python source (zipped by CodeBuild at deploy time)
+  ├── params.json.template
+  └── params.json     # rendered at deploy time (gitignored)
+
+migration_tool/       # Python orchestrator for the migration steps
+steps/                # bash scripts for each migration step
+seed/                 # source-side seed data scripts
+config/               # runtime config files (gitignored)
+state/                # runtime state files (gitignored)
+```
+
+---
+
+## What `seed.sh provision` creates
+
+You don't have a real source account to test against — `seed.sh` builds one. It dispatches per-service modules under `seed/<service>/{create,teardown}.sh` in canonical order so a single command stands up the whole surface.
+
+| What gets built | Why |
 |---|---|
-| `seed.sh` | Provisions a representative source-account analytics surface (Glue + RDS + MSK + Kinesis + Firehose + SNS + Lambda + CloudWatch + MWAA) so you have something realistic to migrate. |
-| `nuke.sh` | Audits AWS directly and tears down every resource matching the seed prefix. Use this to wipe the seed account back to empty. |
-| `migrate.sh run` | Runs the migration. Bootstraps SMUS infrastructure (IDC, IAM, CFN), then walks the migration tool through 9 steps that stand up the SMUS domain and migrate Glue, S3, and MWAA. |
-| `migrate.sh teardown` | Reverses everything `migrate.sh run` did, including hardening passes for the SMUS-specific deletion gotchas. |
+| **VPC + private subnets** in two AZs | Networking the SMUS Tooling environment will reuse |
+| **Glue Data Catalog**: `smus-seed-db-raw` + `smus-seed-db-curated` (~6 tables) | Realistic source-side Glue catalog the migration walks |
+| **S3 data buckets**: raw/, curated/, scripts/ | Backing storage for the Glue tables |
+| **RDS** (Aurora MySQL) | Source database for the Glue→Iceberg ETL pattern |
+| **MSK** + **Kinesis** + **Firehose** + **SNS** | Streaming services that show up in the migration's portability report |
+| **Glue jobs** (PySpark, Python shell, RDS-to-Iceberg) | Source code the migration converts to SMUS notebooks |
+| **MWAA Airflow environment** + DAG bucket | Source workflows the migration extracts and re-deploys into SMUS |
+| **Lambda functions** + CloudWatch alarms | Inventory targets — surfaced in the portability report but not migrated |
 
-## What `seed.sh` does
+Wall-clock: ~25 minutes (most of that is MWAA — it always takes 25+ minutes).
 
-`seed.sh` is the source-account provisioner. It dispatches per-service modules under `./seed/<service>/{create,teardown}.sh` in canonical order so a single command brings up the whole surface or tears it back down. Default mode is dry-run; pass `--apply` to actually create AWS resources.
+State is tracked in `seed/seed.state.json`. Run `./scripts/seed.sh status` any time to see what's been provisioned. After `smus-setup.sh` runs, the seed state file is also where the SMUS setup reads VPC and subnet IDs from.
 
-The thirteen-step provision sequence is fixed:
+---
+
+## What `smus-setup.sh setup` builds
+
+It creates everything via one CloudFormation deploy:
+
+- A SMUS DataZone domain
+- An admin project owned by an IDC group
+- 17 environment blueprints + a Tooling environment + a Lakehouse Database environment
+- Several IAM roles (domain execution, service, manage-access, automation, LF registration)
+- A Lake Formation registration role + KMS key + S3 buckets
+- A small Python Lambda (built inside the stack via CodeBuild) that runs post-deploy work and pre-delete cleanup
+
+You can tweak every CloudFormation parameter — see the next section.
+
+---
+
+## CloudFormation parameter inputs
+
+There are 20 inputs to the CloudFormation stack. **Every one is overridable.** The script resolves each through this priority chain:
 
 ```
-network → glue(foundation) → rds → glue(rds-bridge) → sns → msk → kinesis
-       → data-gen → firehose → glue(crawler) → glue(kafka)
-       → lambda → cloudwatch → mwaa
+CLI flag  >  environment variable  >  config/smus-setup.config.json  >  auto-discovered  >  hard-coded default
 ```
 
-Glue is dispatched four times across phases so jobs can run against real RDS data **before** the crawler creates catalog tables. This produces a Glue Data Catalog with two databases (`smus-seed-db-raw`, `smus-seed-db-curated`) and six tables — a realistic stand-in for an existing customer's data lake.
+Three workflows:
 
-The Seed Script is fully self-contained:
+1. **Plain run, no overrides** — defaults + auto-discovery do everything. First-time users.
+2. **Interactive (CLI flags)** — pass `--domain-name foo` etc. on the command line. Resolved values are persisted, so the next run picks them up automatically.
+3. **JSON / batch (env vars)** — set `SMUS_DOMAIN_NAME=foo` etc. in your shell or CI YAML. Same effect as CLI flags but easier to thread through automation.
 
-- Its own config file at `./seed/seed.config.json` (bootstrapped on first run from `seed.config.json.example`).
-- Its own state file at `./seed/seed.state.json` (records every provisioned resource ID).
-- Its own logs at `./seed/logs/`.
-- Its own helper library at `./seed/_lib/`.
-- Its own env-var prefix `SBX_*`.
+### Full input parameter list
 
-It never writes the migration tool's config or state files. The only permitted Seed → Migration interaction is reading `./config/migration.config.json` to enforce the same-account contract (Seed and Migration must target the same AWS account).
+| What | CLI flag | Env var | Default / how auto-discovered |
+|---|---|---|---|
+| **SMUS domain name** | `--domain-name NAME` | `SMUS_DOMAIN_NAME` | `smus-seed-domain` |
+| **Admin project name** | `--admin-project-name NAME` | `SMUS_ADMIN_PROJECT_NAME` | `smus-admin` |
+| **Admin IDC group** (owns the admin project) | `--admin-group NAME` | `MT_ADMIN_GROUP_NAME` | Prompted on first run, default `smus-admins`. Resolved to a GUID-style ID via `aws identitystore list-groups`. |
+| **Data engineer IDC group** | `--de-group NAME` | `MT_DE_GROUP_NAME` | Default `smus-data-engineers`. |
+| **Data consumer IDC group** | `--consumer-group NAME` | `MT_CONSUMER_GROUP_NAME` | Default `smus-data-consumers`. |
+| **IDC instance ARN** | `--sso-instance-arn ARN` | `MT_IDENTITY_CENTER_INSTANCE_ARN` | Discovered via `aws sso-admin list-instances` (the account-local instance). |
+| **VPC ID** for the Tooling environment | `--vpc-id ID` | `SMUS_VPC_ID` | Read from `seed/seed.state.json` (`.services.network.resources.vpc_id`). |
+| **Subnet IDs** (comma-separated, private) | `--subnet-ids CSV` | `SMUS_SUBNET_IDS` | Read from `seed/seed.state.json`. Two subnets, one per AZ. |
+| **Tooling S3 bucket name** | `--tooling-bucket NAME` | `SMUS_TOOLING_BUCKET` | `amazon-datazone-tooling-<account>-<region>` |
+| **Templates / Lambda source S3 bucket** | `--templates-bucket NAME` | `SMUS_TEMPLATES_BUCKET` | `smus-seed-cfn-<account>-<region>` |
+| **Lambda source S3 prefix** (optional) | `--lambda-source-prefix STR` | `SMUS_LAMBDA_SOURCE_PREFIX` | `''` (empty) |
+| **Domain execution IAM role name** | `--domain-execution-role-name NAME` | `SMUS_DOMAIN_EXECUTION_ROLE_NAME` | `sagemaker-domain-execution` |
+| **Domain service IAM role name** | `--domain-service-role-name NAME` | `SMUS_DOMAIN_SERVICE_ROLE_NAME` | `AmazonDataZoneServiceRole` |
+| **Automation Lambda IAM role name** | `--automation-role-name NAME` | `SMUS_AUTOMATION_ROLE_NAME` | `smus-seed-automation-role` |
+| **Automation policy name** | `--automation-role-policy-name NAME` | `SMUS_AUTOMATION_ROLE_POLICY_NAME` | `smus-seed-automation-policy` |
+| **Manage-access IAM role name** | `--managed-access-role-name NAME` | `SMUS_MANAGED_ACCESS_ROLE_NAME` | `sagemaker-studio-manage-access-role` |
+| **Git provider** | `--repo-provider PROV` | `SMUS_REPO_PROVIDER` | `CodeCommit` (alternatives: `GitHub`, `GitLab`, `Bitbucket`) |
+| **Git repo / connection name** | `--repo-name NAME` | `SMUS_REPO_NAME` | `<domain-name>-migration` |
+| **Git repo URL** (3P providers) | `--repo-url URL` | `SMUS_REPO_URL` | empty — required for 3P (e.g. `https://github.com/owner/repo.git`) |
+| **Pre-existing connection ARN** | `--repo-connection-arn ARN` | `SMUS_REPO_CONNECTION_ARN` | empty — pin a connection you already created in the console (e.g. for GitHub Enterprise Server / GitLab Self-Managed) |
+
+### Examples
+
+**Default everything (first-time user)**:
+
+```bash
+./scripts/smus-setup.sh setup --apply --yes --profile smus-seed
+```
+
+**Interactive — change the domain and project names**:
+
+```bash
+./scripts/smus-setup.sh setup --apply --yes --profile smus-seed \
+    --domain-name acme-prod-domain \
+    --admin-project-name acme-platform-admin
+```
+
+**Use existing IDC groups** (the groups must already exist in IDC; the script halts with exit 65 if they don't):
+
+```bash
+./scripts/smus-setup.sh setup --apply --yes --profile smus-seed \
+    --admin-group acme-platform-admins \
+    --de-group acme-data-engineers \
+    --consumer-group acme-data-consumers
+```
+
+**Specify VPC / subnets directly** (useful if you don't run `seed.sh` first):
+
+```bash
+./scripts/smus-setup.sh setup --apply --yes --profile smus-seed \
+    --vpc-id vpc-0abc123 \
+    --subnet-ids subnet-0aaa,subnet-0bbb
+```
+
+**Pin everything for a CI run**:
+
+```bash
+./scripts/smus-setup.sh setup --apply --yes --profile smus-seed \
+    --domain-name acme-prod-domain \
+    --admin-project-name acme-platform-admin \
+    --admin-group acme-platform-admins \
+    --de-group acme-data-engineers \
+    --consumer-group acme-data-consumers \
+    --sso-instance-arn arn:aws:sso:::instance/ssoins-... \
+    --vpc-id vpc-0abc123 \
+    --subnet-ids subnet-0aaa,subnet-0bbb \
+    --tooling-bucket amazon-datazone-tooling-acme-prod \
+    --templates-bucket acme-smus-templates-prod \
+    --domain-execution-role-name acme-smus-domain-exec \
+    --domain-service-role-name acme-smus-domain-svc \
+    --automation-role-name acme-smus-automation \
+    --managed-access-role-name acme-smus-manage-access
+```
+
+**Same thing via env vars** (CI YAML use case — set once, run multiple commands):
+
+```bash
+export AWS_PROFILE=smus-seed
+export SMUS_DOMAIN_NAME=acme-prod-domain
+export SMUS_ADMIN_PROJECT_NAME=acme-platform-admin
+export MT_ADMIN_GROUP_NAME=acme-platform-admins
+export MT_DE_GROUP_NAME=acme-data-engineers
+export MT_CONSUMER_GROUP_NAME=acme-data-consumers
+export SMUS_VPC_ID=vpc-0abc123
+export SMUS_SUBNET_IDS=subnet-0aaa,subnet-0bbb
+export SMUS_TEMPLATES_BUCKET=acme-smus-templates-prod
+./scripts/smus-setup.sh setup --apply --yes
+```
+
+**Re-run with persisted values** — every value resolved on a previous run is saved to `config/smus-setup.config.json`. So this works:
+
+```bash
+# First run sets everything
+./scripts/smus-setup.sh setup --apply --yes --profile smus-seed --domain-name acme-prod-domain
+
+# Second run just uses what was saved last time — no flag needed
+./scripts/smus-setup.sh setup --apply --yes --profile smus-seed
+```
+
+### Git connection (CodeCommit vs 3P)
+
+Per the SageMaker Unified Studio admin guide, **Git connections attach at the domain level** (a CodeConnections resource that SMUS surfaces on the domain's Connections tab). The setup stack handles both flavors:
+
+- **CodeCommit (default)** — CFN creates an `AWS::CodeCommit::Repository` named `<domain>-migration` (override with `--repo-name`). SMUS auto-provisions a default CodeCommit connection on every domain, so nothing else is needed. The repo is fully managed by the stack — `smus-setup.sh teardown` deletes it.
+- **3P providers (GitHub / GitLab / Bitbucket)** — Pass `--repo-provider GitHub --repo-url https://github.com/owner/repo.git`. CFN creates an `AWS::CodeConnections::Connection` that lands in `PENDING` state and stays there until you complete the one-time OAuth handshake (see banner below).
+- **GitHub Enterprise Server / GitLab Self-Managed** — These need a separate CodeConnections `Host` resource that itself requires an OAuth-style setup against the on-prem server. Easiest path is to create the Host + Connection in the AWS console once, then pass `--repo-connection-arn arn:aws:codeconnections:...` to skip the create entirely. The stack only grants the project user role permission to use the supplied ARN.
+
+> ## ⚠️ ATTENTION — Two manual steps for 3P providers
+>
+> When `--repo-provider` is anything other than `CodeCommit`, two one-time clicks are required after stack create. **Both are by AWS design and cannot be automated** — there's no public AWS API for either.
+>
+> **Step 1 — Authorize the connection** (CodeConnections OAuth handshake):
+>
+> 1. Open: `https://<region>.console.aws.amazon.com/codesuite/settings/connections`
+> 2. Find your connection by the name from `--repo-name` (Connection status column reads `Pending`)
+> 3. Click **Update pending connection**
+> 4. Sign in to GitHub / GitLab / Bitbucket and authorize the AWS app
+> 5. Confirm the Connection status flips to `Available`
+>
+> **Step 2 — Enable the connection on the SMUS domain** (per-domain toggle):
+>
+> 1. Open: `https://<region>.console.aws.amazon.com/datazone/home?region=<region>#/domains`
+> 2. Click your domain name → **Connections** tab
+> 3. Select the connection row (Project status column reads `Disabled`)
+> 4. Click **Enable** in the top-right toolbar and confirm in the popup
+> 5. Refresh the page — Project status should read `Enabled`
+>
+> Until both steps are done, project members can't clone or push through this connection. The `aws-smus-cicd-cli` and JupyterLab Git panel will fail with auth errors.
+>
+> **Why two clicks:** AWS treats Step 1 (authorize) and Step 2 (per-domain enable) as separate trust boundaries. The OAuth handshake gives AWS read/write access to your 3P repos; the per-domain enable then explicitly grants every signed-in user in the AWS account access to that connection. Per the SMUS admin guide: *"When you enable a Git connection, all users who can sign in to any domain in the account have read and write access to all repositories on that connection."*
+>
+> **Verifying:** re-run `./scripts/smus-setup.sh setup --apply --yes` — it short-circuits (stack already healthy), reads the live connection state, and prints `repo_connection_state: AVAILABLE` instead of the banner. You can also check with:
+>
+> ```bash
+> aws codeconnections get-connection \
+>     --connection-arn $(jq -r .repo_connection_arn config/smus-setup.config.json) \
+>     --query 'Connection.ConnectionStatus'
+> ```
+>
+> The per-domain `Enabled` flag isn't readable through any public AWS API — verify visually on the domain's Connections tab.
+>
+> **Re-runs are safe:** the connection ARN, repo URL, and provider are persisted to `config/smus-setup.config.json` after each setup run. `migrate.sh` step 01 reads them automatically — no `--set git_connection_id=...` plumbing needed.
+>
+> **Teardown:** `./scripts/smus-setup.sh teardown` deletes the connection (and the CodeCommit repo when that branch was used) as part of the stack delete. The actual GitHub / GitLab / Bitbucket repository on the 3P side is left alone — it lives outside the AWS account.
+
+```bash
+# CodeCommit (default — nothing to pass)
+./scripts/smus-setup.sh setup --apply --yes
+
+# GitHub — landing connection in PENDING; authorize banner appears at end of run
+./scripts/smus-setup.sh setup --apply --yes \
+    --repo-provider GitHub \
+    --repo-url https://github.com/acme-corp/data-platform.git
+
+# Reuse a pre-existing CodeConnections connection (e.g. for GHES) — no banner,
+# no manual step (assumes you already authorized when you created it)
+./scripts/smus-setup.sh setup --apply --yes \
+    --repo-provider GitHub \
+    --repo-connection-arn arn:aws:codeconnections:us-east-1:111122223333:connection/abcd-...
+```
+
+Sample banner you'll see at the end of a 3P setup run while the connection is still `PENDING`:
+
+```
+    repo_provider:         GitHub
+    repo_name:             smus-seed-domain-migration
+    repo_connection_arn:   arn:aws:codeconnections:us-east-1:111122223333:connection/abcd-...
+    repo_connection_state: PENDING
+
+    ============================================================
+    ACTION REQUIRED: Authorize the Git connection.
+    1. Open: https://us-east-1.console.aws.amazon.com/codesuite/settings/connections
+    2. Find connection 'smus-seed-domain-migration' (state: Pending)
+    3. Click 'Update pending connection' and complete the OAuth flow.
+    Until done, the connection cannot be used for Git pulls.
+    ============================================================
+```
+
+---
 
 ## What `migrate.sh run` does
 
-`migrate.sh run` is a wrapper around `python -m migration_tool` that adds:
+A wrapper around the Python migration tool that runs 9 steps in order. Each step does one specific job:
 
-1. **Pre-step bootstraps.** Idempotent setup of SMUS-adjacent infrastructure that lives outside the migration tool's per-step scripts — IDC users/groups, IAM roles, CloudFormation stack for the SMUS domain + project, Lake Formation grants, KMS key access, asset auto-subscription, resource-link DESCRIBE grants. Each helper short-circuits on dry-run, runs idempotently in apply mode.
-2. **Migration tool dispatch.** Calls the Python orchestrator with the right `--set` overrides pre-injected so the run doesn't pause for prompts already answered by the bootstrap helpers.
-3. **Hardened teardown.** A symmetric `migrate.sh teardown` walks the bootstrap chain in reverse with the failure-mode patches we've learned the hard way.
-
-The migration tool itself runs nine canonical steps:
-
-| # | ID | What it does |
+| # | Step | What it does |
 |---|---|---|
-| 1 | `01_create-smus-domain` | Wires IDC, deploys the SMUS domain CFN stack, creates the Admin Project, registers the Git connection. |
-| 2 | `02_portability` | Classifies every service as Full/Inventory-only/Excluded and writes `portability-report.json`. |
-| 3 | `03_glue-jobs` | Exports every Glue job script, generates SMUS-compatible notebooks, commits to `data-pipelines/glue-jobs/`. |
-| 3b | `03b_lakeformation-setup` | Adds LF admins, registers S3 locations in hybrid mode, grants per-DB and per-table permissions. |
-| 4 | `04_catalog` | Creates a Glue-type DataZone data source, triggers the initial sync to publish tables as assets. |
-| 5 | `05_s3-data` | Builds the candidate-bucket list (Glue jobs + catalog locations + MWAA buckets minus DAG bucket) and `aws s3 sync`s into the SMUS-managed location. |
-| 6 | `06_mwaa-extract` | Pulls DAGs, plugins, requirements out of the source MWAA bucket; commits DAGs to `data-pipelines/workflows/dags/`. |
-| 7 | `07_mwaa-integrate` | Generates `manifest.yaml` and runs `aws-smus-cicd-cli deploy` against the Admin Project's MWAA. |
-| 8 | `08_dag-yaml` | (Gated by `--convert-dags`.) AST-scans DAGs against the Airflow→YAML allowlist and converts the convertible ones. |
-| 9 | `09_cicd` | Emits the provider-native pipeline file (`deploy.yml` / `.gitlab-ci.yml` / `bitbucket-pipelines.yml`) plus aggregated CI/CD manifest. For CodeCommit, writes `MANUAL-CI-WIRING.md` and stops short of pushing. |
+| 01 | `create-smus-domain` | Confirm the domain `smus-setup.sh` built. Resolve repo / connection IDs from the setup config (CFN owns the repo and connection — this step just records the binding). |
+| 02 | `portability` | Classify every AWS service: Full / Inventory-only / Excluded. Writes `portability-report.json`. |
+| 03 | `glue-jobs` | Export every Glue job script, convert to a SageMaker notebook, commit to `data-pipelines/glue-jobs/`. |
+| 03b | `lakeformation-setup` | Re-grant Lake Formation permissions on every seed database and table. |
+| 04 | `catalog` | Tell SMUS to scan the seed Glue databases and publish their tables as searchable assets. |
+| 05 | `s3-data` | Copy data files from source S3 buckets into the SMUS-managed location. |
+| 06 | `mwaa-extract` | Pull DAGs, plugins, requirements out of the source MWAA bucket; commit DAGs to `data-pipelines/workflows/dags/`. |
+| 07 | `mwaa-integrate` | Use `aws-smus-cicd-cli` to deploy DAGs into the admin project's MWAA. |
+| 08 | `dag-yaml` | (Optional, `--convert-dags`.) Convert Python DAGs to SMUS YAML format where possible. |
+| 09 | `cicd` | (Optional, `--push-cicd`.) Generate provider-native pipeline file (`deploy.yml` / `.gitlab-ci.yml` / etc.) and `git push` to the configured repo. **Requires local Git credentials for 3P providers** — see "Step 09 prerequisites" below. |
 
-Default is dry-run. Pass `--apply` to actually execute AWS calls and commits.
+Each step writes its progress to `state/migration.state.json`, so a partial failure can be resumed by simply re-running the command — already-completed steps are skipped automatically.
 
-## Migration flow
+Wall-clock: ~15-20 minutes if everything works first try.
 
-```mermaid
-flowchart TB
-    classDef source fill:#fff7e6,stroke:#d48806,color:#000
-    classDef seed fill:#fffbe6,stroke:#faad14,color:#000
-    classDef bootstrap fill:#f6ffed,stroke:#52c41a,color:#000
-    classDef step fill:#e6f7ff,stroke:#1890ff,color:#000
-    classDef smus fill:#f9f0ff,stroke:#722ed1,color:#000
-    classDef teardown fill:#fff1f0,stroke:#cf1322,color:#000
+Pre-run helpers (run by the wrapper before the migration tool fires):
 
-    subgraph SOURCE["Source AWS account"]
-        SeedSh["seed.sh provision --apply"]:::seed
-        GlueDB["Glue catalog<br/>smus-seed-db-raw<br/>smus-seed-db-curated"]:::source
-        S3Data["S3 data buckets<br/>raw/, curated/, scripts/"]:::source
-        MwaaSrc["MWAA env<br/>+ DAG bucket"]:::source
-        SNS["SNS topics"]:::source
-        Lambda["Lambda funcs"]:::source
-        Streams["MSK + Kinesis<br/>+ Firehose"]:::source
-        SeedSh --> GlueDB
-        SeedSh --> S3Data
-        SeedSh --> MwaaSrc
-        SeedSh --> SNS
-        SeedSh --> Lambda
-        SeedSh --> Streams
-    end
+- **Repo bootstrap** — initializes the project root as a Git working tree of the repo set up in CFN (CodeCommit clone URL, or a 3P URL discovered through the CodeConnections connection) so Step 6 can `git commit` extracted DAGs. Skips politely for 3P providers, where the operator wires the local tree manually after the OAuth handshake.
+- **CICD CLI install** — `pip install aws-smus-cicd-cli` into the venv so Step 7 can deploy the DAGs.
+- **Auto-subscribe** — subscribes the admin project to its own published Glue assets (clears the "Asset cannot be queried with tools" badge).
+- **Resource-link DESCRIBE grants** — gives the project user role `DESCRIBE` on every resource link in `glue_db_<env_id>`.
 
-    SOURCE --> MIGSH
+### Step 09 prerequisites (`--push-cicd`, optional)
 
-    subgraph MIGSH["migrate.sh run --apply"]
-        direction TB
-        Boot1["IDC + IAM bootstrap<br/>users / groups / roles"]:::bootstrap
-        Boot2["CFN bootstrap<br/>SMUS domain + project + blueprints"]:::bootstrap
-        Boot3["LF bootstrap<br/>revoke IAMAllowedPrincipals<br/>grant Describe/Select +Grantable<br/>(project + manage-access roles)"]:::bootstrap
-        Boot4["Session bootstrap<br/>tooling-bucket hybrid mode<br/>KMS key policy"]:::bootstrap
-        Boot5["Auto-subscribe + resource link<br/>DESCRIBE grants"]:::bootstrap
+> ## ⚠️ ATTENTION — Step 09 needs local Git credentials for 3P providers
+>
+> Step 09 (`cicd`) does two things: generate a provider-native pipeline file (`deploy.yml` / `.gitlab-ci.yml` / `bitbucket-pipelines.yml`) and `git push` it to the configured repo.
+>
+> **Why it's now opt-in:** the AWS CodeConnections connection we wire up in CFN authenticates Git operations *inside* the SMUS portal (JupyterLab, Code Editor) — it does **not** authenticate `git push` calls made from the migration tool's local working tree. AWS has no equivalent of the CodeCommit credential helper for 3P providers; you need a personal access token, SSH key, or `gh auth login` set up locally.
+>
+> **For CodeCommit users:** Step 09 just works — the AWS CLI credential helper signs requests with the active AWS profile. No setup needed.
+>
+> **For GitHub / GitLab / Bitbucket users:** set up local Git auth before passing `--push-cicd`. Pick whichever fits your workflow:
+>
+> ```bash
+> # Option A — GitHub CLI (interactive, easiest for personal accounts)
+> gh auth login
+>
+> # Option B — Personal access token cached by the OS keychain
+> git config --global credential.helper osxkeychain    # macOS
+> # OR: git config --global credential.helper "cache --timeout=86400"  # Linux/WSL
+> git push                                              # one push prompts for token, then it's cached
+>
+> # Option C — SSH (if your repo URL is the SSH form)
+> ssh-keygen -t ed25519 -C "you@example.com"
+> # add ~/.ssh/id_ed25519.pub to GitHub / GitLab / Bitbucket settings
+> ```
+>
+> **Then run with the opt-in flag:**
+>
+> ```bash
+> ./scripts/migrate.sh run --apply --yes -- --push-cicd
+> ```
+>
+> **Or, run only Step 09 after a previous full migration:**
+>
+> ```bash
+> ./scripts/migrate.sh run --apply --yes -- --step 09_cicd --push-cicd
+> ```
+>
+> **Skipping Step 09 doesn't break the migration.** Steps 01-08 produce a fully working SMUS deployment with the data, Glue notebooks, and DAGs migrated. The pipeline file is a convenience artifact — you can `git push` the working tree manually any time, or skip CI/CD entirely if your team uses a different deployment system.
 
-        Boot1 --> Boot2 --> Boot3 --> Boot4 --> Boot5
+### Targeting an existing SMUS domain (bring-your-own)
 
-        Boot5 --> S1["01 create-smus-domain"]:::step
-        S1 --> S2["02 portability"]:::step
-        S2 --> S3["03 glue-jobs<br/>script export + notebook gen"]:::step
-        S3 --> S3b["03b lakeformation-setup<br/>register S3 + DB/table grants"]:::step
-        S3b --> S4["04 catalog<br/>create data source + sync"]:::step
-        S4 --> S5["05 s3-data<br/>aws s3 sync"]:::step
-        S5 --> S6["06 mwaa-extract"]:::step
-        S6 --> S7["07 mwaa-integrate<br/>aws-smus-cicd-cli deploy"]:::step
-        S7 --> S9["09 cicd"]:::step
-    end
+If you already have a SMUS domain in your account — provisioned by your own infra-as-code, an internal SMUS deployment, or a previous run of this toolkit — skip `smus-setup.sh setup` and run `migrate.sh` directly against it with `--bring-your-own`.
 
-    MIGSH --> SMUS
-
-    subgraph SMUS["SMUS domain"]
-        Domain["DataZone domain<br/>+ Admin project"]:::smus
-        ProjDB["glue_db_envid<br/>(resource links)"]:::smus
-        Notebooks["notebooks /<br/>data-pipelines/glue-jobs/"]:::smus
-        DAGs["DAGs /<br/>data-pipelines/workflows/"]:::smus
-        Assets["Catalog assets<br/>(subscribed)"]:::smus
-        Domain --- ProjDB
-        Domain --- Notebooks
-        Domain --- DAGs
-        Domain --- Assets
-    end
-
-    SMUS -. "migrate.sh teardown --apply" .-> Teardown["Teardown<br/>VPC endpoints<br/>cross-SG ingress<br/>environments<br/>LF admins<br/>CFN stack"]:::teardown
-    Teardown -. "back to clean state" .-> MIGSH
-```
-
-## Quick start
-
-The end-to-end loop you'll run repeatedly:
+**Auto-discover IDs from names** (most common):
 
 ```bash
-./seed.sh provision --apply --profile smus-seed       # stand up source data
-./migrate.sh run --apply --profile smus-seed --yes    # migrate it into SMUS
-# … verify in the SMUS portal …
-./migrate.sh teardown --apply --profile smus-seed --yes  # remove SMUS layer
-./nuke.sh --apply --profile smus-seed --yes           # wipe seed account
+./scripts/migrate.sh run --apply --yes --profile mycorp \
+    --bring-your-own \
+    --domain-name acme-platform-domain \
+    --admin-project-name acme-migration-admin
 ```
 
-Each script defaults to dry-run, so you can preview without touching AWS by leaving off `--apply`.
+The script looks up the domain ID, project ID, project profile ID, domain service role, and IDC instance ARN automatically and persists them to `config/smus-setup.config.json` for subsequent runs.
 
-### `seed.sh`
-
-Provision the source-side analytics surface:
+**Pass explicit IDs** (useful when the runner's IAM doesn't allow `datazone:ListDomains` or `datazone:ListProjects`):
 
 ```bash
-# Preview (no AWS calls)
-./seed.sh provision --profile smus-seed
-
-# Apply — full canonical sequence
-./seed.sh provision --apply --profile smus-seed
-
-# Apply only specific services (e.g. skip MWAA in CI to save 25 min)
-./seed.sh provision --apply --skip-mwaa --profile smus-seed
-
-# Apply only Glue + RDS
-./seed.sh provision --apply --glue --rds --profile smus-seed
-
-# Inspect current state
-./seed.sh status --profile smus-seed
-
-# Tear down everything
-./seed.sh teardown --apply --profile smus-seed
+./scripts/migrate.sh run --apply --yes --profile mycorp \
+    --smus-domain-id dzd-abc123 \
+    --admin-project-id xyz789 \
+    --admin-project-profile-id pp-def456
 ```
 
-Flags:
-- `--apply` / `--dry-run` (default dry-run; mutually exclusive)
-- `--profile NAME` AWS CLI profile (or set `AWS_PROFILE`)
-- `--region NAME` override region (defaults from `seed/seed.config.json`)
-- `--all` (default) or per-service flags `--network`, `--glue`, `--rds`, `--sns`, `--msk`, `--kinesis`, `--data-gen`, `--firehose`, `--lambda`, `--cloudwatch`, `--mwaa`
-- `--skip <service>` exclude one service from `--all`
+Required IAM permissions for auto-discovery:
+- `datazone:ListDomains`, `datazone:GetDomain`
+- `datazone:ListProjects`, `datazone:GetProject`
+- `sso-admin:ListInstances`
+- `sts:GetCallerIdentity`
 
-### `migrate.sh`
+In BYOD mode the toolkit's `state/smus-setup.state.json` doesn't need to exist. The script:
+1. Resolves the IDs (auto-discovery or explicit flags)
+2. Persists them to `config/smus-setup.config.json` so re-runs work without flags
+3. Proceeds with the same migration helpers + 9-step run as the seed flow
 
-Stand up SMUS and run the migration:
+If you pass `--bring-your-own` but neither names nor IDs, defaults `smus-seed-domain` / `smus-admin` are used (same as the seed flow names).
+
+---
+
+## Adding more Glue databases later
+
+Use `scripts/add-glue-databases.sh` to bring additional Glue catalog databases into the admin project after the initial migration is complete. Every step is idempotent — safe to re-run.
 
 ```bash
-# Preview
-./migrate.sh run --dry-run --profile smus-seed
-
-# Apply — full migration end-to-end
-./migrate.sh run --apply --yes --profile smus-seed
-
-# Re-run a single step (e.g. notebook generation)
-./migrate.sh run --apply --yes --profile smus-seed -- --force 03_glue-jobs
-
-# Run a contiguous range
-./migrate.sh run --apply --yes --profile smus-seed -- --from 03_glue-jobs --to 06_mwaa-extract
-
-# Include the optional Python DAG → YAML conversion (Step 8)
-./migrate.sh run --apply --yes --profile smus-seed -- --convert-dags
-
-# Inspect run state
-./migrate.sh status
-
-# Reset just the migration state file (does NOT touch AWS)
-./migrate.sh reset --yes
+./scripts/add-glue-databases.sh \
+    --databases mydb1,mydb2,mydb3 \
+    --apply --profile smus-seed --yes
 ```
 
-Flags:
-- `--apply` / `--dry-run` (default dry-run; mutually exclusive)
-- `--profile NAME` AWS CLI profile
-- `--region NAME` override region
-- `--yes` skip the apply-mode confirmation prompt
-- `-- <args>` everything after `--` is forwarded to `python -m migration_tool` (use this for `--from`, `--to`, `--step`, `--force`, `--reset`, `--convert-dags`, `--set k=v`)
+What it does for each named database:
 
-### `migrate.sh teardown`
+1. Validates the DB exists in Glue.
+2. Revokes `IAMAllowedPrincipals` on the DB + tables; grants `DESCRIBE/SELECT (+Grantable)` to the project user role and the manage-access role.
+3. Registers the unique S3 prefixes (one per table location) with `--with-federation --hybrid-access-enabled`.
+4. Adds the DB to the project's Glue data source (or creates a new one) and triggers a sync run.
+5. Auto-subscribes the admin project to the resulting listings.
+6. Grants `DESCRIBE` on the new resource links inside the project's managed Glue DB.
 
-Reverse everything `migrate.sh run` did:
+Required flag:
+
+| Flag | What it does |
+|---|---|
+| `--databases CSV` | Comma-separated list of Glue database names. |
+
+Optional flags:
+
+| Flag | What it does |
+|---|---|
+| `--data-source-name NAME` | Override the data source name. Defaults to the migration tool's `migration-tool-glue-catalog` (if it exists) so the new DBs land in the same publish target as the seed flow. |
+| `--apply` / `--dry-run` | Default dry-run. |
+| `--profile NAME`, `--region NAME`, `--yes` | Standard. |
+
+Wall-clock: ~1-2 minutes per database (most of that is waiting for the data source sync run to publish listings).
+
+Re-run if subscriptions or resource-link grants don't take effect on the first try — the listings show up asynchronously after the sync.
+
+---
+
+## What `migrate.sh teardown` does
+
+Reverses only the migration-side mutations — does NOT delete the SMUS domain.
+
+1. Cancels every active subscription the admin project holds.
+2. Revokes the Lake Formation `DESCRIBE` permissions on resource links.
+3. Wipes the migration state file.
+
+Wall-clock: ~30 seconds.
+
+---
+
+## What `smus-setup.sh teardown` does
+
+Deletes the SMUS CloudFormation stack. The in-stack Lambda runs nine hardening passes BEFORE CFN deletes anything (orphan ENI drain, dangling LF admin strip, force-delete project, tooling bucket drain, etc.) — so a healthy delete-stack works end-to-end without manual intervention.
+
+Repo cleanup is part of the stack delete:
+- For **CodeCommit**, the in-stack `AWS::CodeCommit::Repository` is deleted (the entire commit history goes with it — back up first if you need to keep it).
+- For **3P providers**, the `AWS::CodeConnections::Connection` is deleted, but the actual GitHub / GitLab / Bitbucket repository is left alone — those live outside the AWS account.
+
+Wall-clock: ~10-15 minutes.
+
+---
+
+## What `nuke.sh` does
+
+Wipes the fake source data created by `seed.sh`. Audits AWS directly (doesn't trust the seed state file) and deletes every resource whose name starts with the seed prefix (default `smus-seed-`).
+
+Wall-clock: ~10 minutes.
+
+Override the prefix or region with `--prefix NAME` and `--region NAME`.
+
+---
+
+## Other script flags
+
+### Common flags (apply to all four scripts)
+
+| Flag | Purpose |
+|---|---|
+| `--apply` | Actually do things in AWS. Required to make changes. |
+| `--dry-run` | Show what WOULD happen but don't change anything. Default. |
+| `--profile NAME` | AWS CLI profile (or set `AWS_PROFILE`). |
+| `--region NAME` | AWS region (or set `AWS_DEFAULT_REGION`; defaults to `us-east-1`). |
+| `--yes` / `-y` | Skip the confirmation prompt. |
+
+### Action verbs
+
+```
+./scripts/seed.sh         provision | teardown | status
+./scripts/smus-setup.sh   setup     | teardown | status
+./scripts/migrate.sh      run       | teardown | status | reset
+./scripts/nuke.sh         (no verb — just runs the wipe)
+```
+
+### Migration tool passthrough flags
+
+`migrate.sh run` is a wrapper. Anything after `--` goes to `python -m migration_tool`:
+
+| Flag | What it does |
+|---|---|
+| `--step <id>` | Run only that one step. Example: `--step 03_glue-jobs`. |
+| `--from <id>` | Start from this step. |
+| `--to <id>` | Stop after this step. |
+| `--force <id>` | Re-run a step even if it's already marked completed. |
+| `--reset <id>` | Reset a step's status to pending. |
+| `--reconfigure` | Re-prompt for every config value. |
+| `--set <key>=<value>` | Pre-set one config value. Multiple `--set` flags allowed. |
+| `--convert-dags` | Include the optional Step 8 (Python DAG → YAML conversion). |
+| `--push-cicd` | Include the optional Step 9 (CI/CD pipeline file + git push). 3P providers need local Git credentials — see "Step 09 prerequisites" above. |
+
+Examples:
 
 ```bash
-# Preview
-./migrate.sh teardown --dry-run --profile smus-seed
+# Re-run only the Glue jobs step
+./scripts/migrate.sh run --apply --yes -- --force 03_glue-jobs
 
-# Apply (full unwind, deletes the CFN stack)
-./migrate.sh teardown --apply --yes --profile smus-seed
+# Run steps 3 through 6
+./scripts/migrate.sh run --apply --yes -- --from 03_glue-jobs --to 06_mwaa-extract
 
-# Apply but keep the CFN stack (e.g. only undo LF/KMS/IAM tweaks)
-./migrate.sh teardown --apply --yes --keep-cfn --profile smus-seed
-
-# Apply but keep the project user role's inline IAM policies
-./migrate.sh teardown --apply --yes --keep-iam-roles --profile smus-seed
+# Pre-set the repo provider so the prompt doesn't appear
+./scripts/migrate.sh run --apply --yes -- --set repo_provider=codecommit
 ```
 
-What teardown does, in order:
+The migration tool will prompt interactively for any config value it doesn't have. Pre-set values via `--set` to skip prompts. Persistent values live in `config/migration.config.json`.
 
-1. Cancel/revoke every active subscription the admin project holds.
-2. Revoke the LF DESCRIBE grants we added on resource links and the project DB.
-3. Remove the `AllowProjectUserRoleForSparkLogs` statement from the tooling-bucket KMS key policy.
-4. Detach the Step 3 inline IAM policies (`GlueSparkLogsAccess`, `GlueDataBucketAccess`, `GlueConnectionAccess`).
-5. Delete the SMUS CFN stack with the **five hardening passes** built in:
-    - Drain SMUS-managed VPC interface endpoints from the Tooling SG.
-    - Revoke cross-SG ingress rules referencing the Tooling SG.
-    - Drive each DataZone environment to fully GONE before parent delete.
-    - Strip dangling principals (project user roles whose IAM role is gone) from the LF data-lake admins list.
-    - Retry the domain sub-stack delete with `--retain-resources rSUSDomainOwnerIAMRole` if the DataZone Owner CFN resource gets stuck on `ConditionalCheckFailed`.
-6. Wipe the migration state file.
+---
 
-Flags:
-- `--apply` / `--dry-run` (default dry-run; mutually exclusive)
-- `--profile NAME` AWS CLI profile
-- `--yes` skip the confirmation prompt (otherwise type `teardown` to confirm)
-- `--keep-cfn` skip step 5
-- `--keep-iam-roles` skip step 4
+## Common gotchas
 
-### `nuke.sh`
+**"My setup --apply prompted for IDC groups but I want to use my company's existing groups."**
 
-Wipe the source account back to empty (audits AWS directly, ignores the seed state file):
+Pass `--admin-group YOUR-GROUP --de-group YOUR-GROUP --consumer-group YOUR-GROUP`. The groups must exist in IDC; the script halts (exit 65) if they don't.
+
+**"Setup failed with 'no account-local IDC instance found'."**
+
+Open the IAM Identity Center console, click "Enable" for your region, then re-run.
+
+**"Migration failed with 'SMUS setup is not complete'."**
+
+You need to run `smus-setup.sh setup --apply` first. Migration won't run against a half-built domain.
+
+**"I want to re-run only one migration step."**
 
 ```bash
-# Preview
-./nuke.sh --dry-run --profile smus-seed
-
-# Apply
-./nuke.sh --apply --yes --profile smus-seed
-
-# Override prefix or region (defaults from seed.config.json)
-./nuke.sh --apply --yes --profile smus-seed --prefix smus-mig-seed --region us-east-1
+./scripts/migrate.sh run --apply --yes -- --force 03_glue-jobs
 ```
 
-Flags:
-- `--apply` / `--dry-run` (default dry-run; mutually exclusive)
-- `--profile NAME` AWS CLI profile (required unless `AWS_PROFILE` is set)
-- `--region NAME` override region
-- `--prefix NAME` override the resource-name prefix to match
-- `--yes` skip confirmation
+**"How do I see what's in the state files?"**
 
-## Project layout
-
-```
-.
-├── migration_tool/      # Python orchestrator (CLI, config, state, runner, logger, redact, reports)
-├── steps/               # Per-step bash scripts (steps/<NN_kebab-name>/run.sh)
-│   ├── 01_create-smus-domain/
-│   ├── 02_portability/
-│   ├── 03_glue-jobs/
-│   ├── 03b_lakeformation-setup/
-│   ├── 04_catalog/
-│   ├── 05_s3-data/
-│   ├── 06_mwaa-extract/
-│   ├── 07_mwaa-integrate/
-│   ├── 08_dag-yaml/
-│   ├── 09_cicd/
-│   └── inventory/<service>/
-├── cfn/                 # CloudFormation templates deployed by migrate.sh's _cfn_bootstrap
-├── data-pipelines/      # Migrated artifacts (notebooks, DAGs, scripts) — committed by Steps 3 / 6 / 8
-├── seed/                # Self-contained Seed Script (own config, state, logs, helpers)
-│   ├── glue/, rds/, msk/, kinesis/, firehose/, sns/, lambda/, cloudwatch/, mwaa/, network/
-│   ├── seed.config.json.example
-│   ├── seed.state.json.example
-│   └── _lib/common.sh
-├── config/              # migration.config.json — user inputs persisted here
-├── state/               # migration.state.json — per-step status persisted here
-├── logs/                # logs/run-<UTC>.log — one file per CLI invocation
-├── docs/cache/          # Cached AWS Documentation MCP fetches
-├── tests/               # tests/unit/, tests/property/, tests/integration/
-├── seed.sh              # Seed Script entry point
-├── nuke.sh              # Source-account wipe
-└── migrate.sh           # Migration entry point + teardown counterpart
+```bash
+./scripts/smus-setup.sh status   # what setup has done
+./scripts/migrate.sh status      # what migration has done
+./scripts/seed.sh status         # what seed has provisioned
 ```
 
-## Dry-run vs apply semantics
+**"Something failed mid-migration. How do I recover?"**
 
-- **Default is dry-run.** Without `--apply`, every script reads state, prints what it would run, prints what it would write, and changes nothing in AWS or in your code repository.
-- **`--apply` is required for state-changing operations.** Domain creation, repository creation, `aws datazone create-*`, `aws s3 sync`, `git commit`, `git push`, KMS / LF mutations — all of it runs only when `--apply` is passed.
-- **`--apply` and `--dry-run` together exit non-zero.** Mutually exclusive, by design.
-- **`--yes` skips the apply-mode confirmation prompt.** Use this in CI; without it, the script asks the operator to type the action verb on stdin to confirm.
+1. Look at the error in `logs/migrate-<timestamp>.log`.
+2. Fix what's broken in AWS.
+3. Re-run `./scripts/migrate.sh run --apply --yes`. Already-completed steps are skipped.
 
-## Hybrid architecture
+If a step is stuck `in_progress`:
 
-The migration tool is a thin Python orchestrator paired with per-step bash scripts:
+```bash
+./scripts/migrate.sh run --apply --yes -- --reset 05_s3-data
+./scripts/migrate.sh run --apply --yes
+```
 
-- **Python orchestrator** (`migration_tool/`) — sequencing, interactive prompts, configuration persistence, state tracking, idempotency, output parsing, redaction, logging, end-of-run reporting.
-- **Bash step scripts** (`steps/<NN_kebab-name>/run.sh`) — every AWS interaction. Each script issues `aws ...` invocations and emits `STATUS:` lines that the orchestrator parses.
+---
 
-**AWS CLI is the command surface.** No `boto3` or other AWS Python SDK is used in the orchestrator for any operation that targets a source-account or SMUS resource. Provider-specific tools — `git`, `git-remote-codecommit`, `aws-smus-cicd-cli`, `python-to-yaml-dag-converter-mwaa-serverless`, and pipeline linters — are invoked as subprocesses from bash scripts.
+## What's actually happening (advanced)
 
-## Supported `repo_provider` values
+The setup splits naturally into "things CloudFormation can model" and "things that have to happen after CloudFormation finishes." The post-CloudFormation work runs inside the stack as a Lambda function — so from your point of view it's still one `aws cloudformation deploy`.
 
-The tool supports the six Git providers that SMUS Git connections accept:
+**Done by CloudFormation directly:**
 
-- `codecommit` — AWS CodeCommit. The repository is auto-created by Step 1 and registered as a CodeCommit-typed Git connection on the Admin Project.
-- `github` — GitHub.com.
-- `github-enterprise-server` — GitHub Enterprise Server (self-hosted).
-- `gitlab` — GitLab.com.
-- `gitlab-self-managed` — GitLab self-managed (self-hosted).
-- `bitbucket` — Bitbucket Cloud.
+| What | Template |
+|---|---|
+| SMUS DataZone domain | `cfn/child-stacks/sus-domain-stack.yaml` |
+| Domain execution / service / provisioning IAM roles + LF registration role + projects S3 bucket | `cfn/child-stacks/sus-domain-stack.yaml` |
+| 17 blueprints + Tooling S3 bucket + KMS key + manage-access role | `cfn/child-stacks/sus-blueprints-stack.yaml` |
+| 4 project profiles | `cfn/child-stacks/sus-project-profiles-stack.yaml` |
+| Policy grants | `cfn/child-stacks/sus-policy-grant-stack.yaml` |
+| Admin project + group ownership | `cfn/child-stacks/sus-project-stack.yaml` |
+| CodeBuild that zips the loose Python source into a Lambda zip | `cfn/child-stacks/sus-lambda-build-stack.yaml` |
+| The post-deploy / pre-delete Lambda | `cfn/master-stack.yaml` |
 
-Any other value is rejected. The repository URL prompt is skipped for `codecommit` (Step 1 fills `repo_url` from `cloneUrlHttp`); other providers are validated against a provider-specific regex.
+**Done by the in-stack Lambda at create time** (after every other resource is in place):
+
+- Walks every external Glue database, revokes `IAMAllowedPrincipals`, grants `DESCRIBE/SELECT (+Grantable)` to the project user role and the manage-access role.
+- Sets Lake Formation `data-lake-settings` for SMUS Spark sessions (external data filtering, account allow-list, seven session-tag values).
+- Adds `LakeFormationFGACAccess` and `GlueCatalogReadAccess` inline policies on the dynamic project user role (`datazone_usr_role_<projectId>_<envId>`).
+- Adds an `AllowProjectUserRoleForSparkLogs` statement to the Tooling bucket's KMS key policy.
+- Re-registers source S3 prefixes with `--with-federation --hybrid-access-enabled`.
+- (Optional) Adds **CodeCommit Git-ops** permissions if `repo_provider=CodeCommit`, OR a `codeconnections:UseConnection` grant scoped to the specific connection ARN if `repo_provider` is a 3P (so the project user role can mint short-lived Git credentials at clone/push time).
+
+**Done by the in-stack Lambda at delete time** (before CloudFormation deletes anything):
+
+Nine hardening passes cover failure modes CloudFormation can't recover from:
+
+1. Strip the KMS statement we added.
+2. Detach the inline IAM policies on the dynamic project user role.
+3. Drain SMUS-managed VPC endpoints on the Tooling SG.
+4. Force-detach + delete orphan DataZone-owned ENIs.
+5. Revoke cross-SG ingress rules.
+6. Drive each DataZone environment to GONE.
+7. Drop orphaned `glue_db_<env_id>` databases (including ones from previous teardowns).
+8. Force-delete the project if stuck in `DELETE_FAILED`.
+9. Pre-strip the project user role from Lake Formation data-lake admins (so CFN's `rAddDataLakeAdministratorToLakeFormation` delete handler doesn't trip later).
+10. Drain + delete the Tooling S3 bucket (versions + delete markers).
+
+**Why the in-stack Lambda exists:** several operations can't be expressed in CloudFormation — IDC group/user resources don't exist as CFN types; Lake Formation `data-lake-settings` only models the `Admins` field; `register-resource --with-federation` doesn't have a CFN parameter; the dynamic project user role's name isn't known at deploy time. These all run as boto3 calls inside the Lambda after the rest of the stack is up.
+
+---
 
 ## Reference document
 
-The canonical reference for AWS-recommended approaches is `SageMaker Unified Studio - Migration Answers.md` at the repository root. Two sections drive specific design decisions:
+`SageMaker Unified Studio - Migration Answers.md` at the repository root is the canonical reference for AWS-recommended approaches.
 
-- **Section "2. Git Connections"** — source of truth for the six supported `repo_provider` values and the connection types the tool registers via `aws datazone create-connection`.
-- **Section "4. Best Path to Bring Existing Datasets, Glue Jobs, and ML Assets"** — source of truth for the Glue connection onboarding pattern (treat connection metadata as portable in place; register each Glue connection as a SMUS_Connection on the Admin Project).
-
-Each Step_Module README also cites at least one URL fetched and cached from the AWS Documentation MCP server (`docs/cache/`).
+Each per-step README under `steps/` cites at least one URL fetched from the AWS Documentation MCP server (cached under `docs/cache/`).
