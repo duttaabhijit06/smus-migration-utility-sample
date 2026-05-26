@@ -161,6 +161,16 @@ Resources:
               - iam:PutRolePolicy
               - iam:DeleteRolePolicy
               - iam:GetRolePolicy
+              # TagRole/UntagRole/ListRoleTags: needed by the Lambda
+              # helper that re-tags the project user role with
+              # `KmsKeyId` post-creation. DataZone creates the role
+              # with `KmsKeyId=""` when the Tooling env was provisioned
+              # with `enableCmkSupport=false` (the default), which
+              # silently breaks every KMS-by-tag statement in the
+              # AWS-managed `SageMakerStudioProjectUserRolePolicy`.
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:ListRoleTags
             Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/datazone_usr_role_*'
           - Sid: LakeFormationMutations
             Effect: Allow
