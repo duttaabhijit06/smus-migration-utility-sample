@@ -370,6 +370,12 @@ Resources:
             S3Location: !Sub 's3://${rSUSBPToolingBucket}'
             Subnets: !Ref pSUSToolingBPSubnets
             VpcId: !Ref pSUSToolingBPVpcId
+            # Pass the Tooling bucket's KMS key so MWAA's
+            # create-environment uses the same key for env encryption.
+            # Without this, MWAA refuses with: "KMS key used for
+            # encrypting S3 bucket ... is not compatible with the
+            # encryption configuration (null) of the environment."
+            KmsKeyArn: !GetAtt rSUSBPToolingKMSKey.Arn
       EnabledRegions:
         - !Ref 'AWS::Region'
 

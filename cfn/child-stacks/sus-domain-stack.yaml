@@ -225,6 +225,17 @@ Resources:
               - athena:ListSessions
               - athena:TerminateSession
             Resource: '*'
+          - Sid: MWAADiscovery
+            # rPostDeploy's `_attach_mwaa_web_access_policy` lists
+            # MWAA envs + reads their tags so it can grant the dynamic
+            # project user role access ONLY to envs SMUS itself
+            # provisioned (those tagged `AmazonDataZoneDomain`). Legacy
+            # / source MWAA envs are deliberately excluded.
+            Effect: Allow
+            Action:
+              - airflow:ListEnvironments
+              - airflow:ListTagsForResource
+            Resource: '*'
           - Sid: STS
             Effect: Allow
             Action: sts:GetCallerIdentity

@@ -255,9 +255,33 @@ Resources:
             RegionName: !Ref Region
           ConfigurationParameters:
             ParameterOverrides:
+              # mw1.micro is too small for any non-trivial migration
+              # workload (the seed flow alone has 3+ DAGs and the Glue
+              # job notebooks queue up several tasks). mw1.medium is
+              # the minimum size where parallel task scheduling is
+              # reliable. Operators with heavier workloads should
+              # override IsEditable=true and pick mw1.large / xlarge.
               - Name: 'environmentClass'
-                Value: 'mw1.micro'
-                IsEditable: false
+                Value: 'mw1.medium'
+                IsEditable: true
+              # Bump the max worker count from the blueprint default
+              # of 1 to 5 so Airflow can actually parallelise tasks.
+              # MWAA charges per worker only when scaled up, so the
+              # ceiling is safe to widen.
+              - Name: 'maxWorkers'
+                Value: '5'
+                IsEditable: true
+              # mw1.medium (and larger) require >= 2 webservers. The
+              # blueprint default is 1, so create-environment fails
+              # with: "The web server count for environment class
+              # mw1.medium must be greater than 1." Pin both min/max
+              # to 2 so the env class bump above is actually usable.
+              - Name: 'minWebservers'
+                Value: '2'
+                IsEditable: true
+              - Name: 'maxWebservers'
+                Value: '2'
+                IsEditable: true
 
         - Name: 'OnDemand MLExperiments'
           EnvironmentBlueprintId: !Ref MLExperimentsId

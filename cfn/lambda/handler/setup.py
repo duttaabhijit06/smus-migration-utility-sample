@@ -103,6 +103,65 @@ GLUE_CATALOG_READ_POLICY = {
     ],
 }
 
+
+def _mwaa_web_access_policy(account_id: str, region: str, env_name: str) -> dict:
+    """Inline policy that lets the project user role browse + log into the
+    MWAA env from the SMUS portal's Workflows tab.
+
+    Why three statements: MWAA's IAM action surface is split across
+    three resource types (per AWS service authorization reference):
+
+      * ``airflow:ListEnvironments`` has NO resource constraint —
+        it must use ``Resource: "*"``. Without it the Workflows tab's
+        portal-side ``listEnvironments`` REST call returns 403 even if
+        the operator's only env IS the one we just wired up.
+      * ``airflow:GetEnvironment``, ``CreateCliToken``,
+        ``InvokeRestApi``, ``ListTagsForResource`` accept the env ARN
+        ``arn:aws:airflow:<r>:<a>:environment/<env>``.
+      * ``airflow:CreateWebLoginToken`` accepts a DIFFERENT resource
+        type — ``rbac-role`` — formatted as
+        ``arn:aws:airflow:<r>:<a>:role/<env>/<RbacRole>``. The portal
+        mints a Web UI token using the ``Admin`` rbac role for SMUS
+        users by default; we wildcard the role suffix so the same
+        policy works regardless of which rbac role the portal asks for.
+
+    Without this policy, the SMUS portal's Workflows tab shows
+    ``Error retrieving workflow environment <env>`` and the browser
+    devtools console shows the failing GET to
+    ``api.airflow.<region>.amazonaws.com/<env>/...``.
+    """
+    env_arn = f"arn:aws:airflow:{region}:{account_id}:environment/{env_name}"
+    role_arn_pattern = f"arn:aws:airflow:{region}:{account_id}:role/{env_name}/*"
+    return {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "MWAAListEnvironments",
+                "Effect": "Allow",
+                "Action": "airflow:ListEnvironments",
+                "Resource": "*",
+            },
+            {
+                "Sid": "MWAAEnvScopedRead",
+                "Effect": "Allow",
+                "Action": [
+                    "airflow:GetEnvironment",
+                    "airflow:ListTagsForResource",
+                    "airflow:CreateCliToken",
+                    "airflow:InvokeRestApi",
+                ],
+                "Resource": env_arn,
+            },
+            {
+                "Sid": "MWAAWebUILogin",
+                "Effect": "Allow",
+                "Action": "airflow:CreateWebLoginToken",
+                "Resource": role_arn_pattern,
+            },
+        ],
+    }
+
+
 CODECOMMIT_POLICY = {
     "Version": "2012-10-17",
     "Statement": [
@@ -494,6 +553,12 @@ def _smus_session_bootstrap(
         )
         LOG.info("  + %s inline policy applied to %s", policy_name, role_name)
 
+    # 2b'. MWAA web-access inline policy. Attach one statement-set
+    # per discovered MWAA env in the region so the SMUS portal's
+    # Workflows tab can list + open every env the operator has
+    # without us having to know names at deploy time.
+    _attach_mwaa_web_access_policy(role_name, account_id, region)
+
     # 2c. KMS key policy on tooling bucket CMK.
     try:
         enc = s3.get_bucket_encryption(Bucket=tooling_bucket)
@@ -526,6 +591,130 @@ def _smus_session_bootstrap(
     _reregister_s3_prefixes(glue, lf, lf_reg_role_arn, region)
 
     LOG.info("Section 2: complete")
+
+
+def _attach_mwaa_web_access_policy(role_name: str, account_id: str, region: str) -> None:
+    """Inline MWAA web-access policy onto the dynamic project user role.
+
+    Discovers SMUS-managed MWAA envs in the region and attaches a
+    consolidated policy that grants the role enough permission for the
+    SMUS portal's Workflows tab to list + open them.
+
+    SMUS-managed envs are identified by the presence of the
+    `AmazonDataZoneDomain` tag (set by the Workflows blueprint when
+    SMUS provisions an env). Legacy / source MWAA envs that exist in
+    the same account but aren't owned by SMUS are deliberately
+    excluded — granting project users access to them would be an
+    over-scope (the seed environment that the migration *moves data
+    out of* is a typical example).
+
+    Per the MWAA Service Authorization Reference, three statement-types
+    are needed:
+
+      * `airflow:ListEnvironments` — Resource `*` (no resource constraint
+        on this action; without it the portal's listEnvironments REST
+        call returns 403 even with env-scoped read perms below).
+      * `airflow:GetEnvironment / CreateCliToken / InvokeRestApi /
+        ListTagsForResource` — env ARN per env.
+      * `airflow:CreateWebLoginToken` — `rbac-role` ARN
+        (arn:aws:airflow:..:role/<env>/<rbac-role>) per env, wildcarded
+        on the rbac-role suffix to support whichever role the portal
+        requests.
+
+    Skipped silently when no SMUS-managed MWAA envs exist (e.g.
+    operator hasn't clicked "Create" in the Workflows tab yet) so
+    dry-run / partial deployments still work.
+    """
+    iam = boto3.client("iam")
+    mwaa = boto3.client("mwaa", region_name=region)
+
+    all_env_names: list[str] = []
+    try:
+        paginator = mwaa.get_paginator("list_environments")
+        for page in paginator.paginate():
+            all_env_names.extend(page.get("Environments", []))
+    except mwaa.exceptions.ClientError as exc:
+        LOG.warning("  + MWAA list_environments failed: %s; skipping web-access grant", exc)
+        return
+
+    if not all_env_names:
+        LOG.info("  = no MWAA envs in %s; skipping MWAAWebAccess inline", region)
+        return
+
+    # Tag-filter to keep only SMUS-managed envs. The Workflows
+    # blueprint stamps `AmazonDataZoneDomain` on every env it
+    # provisions; legacy / source MWAA envs (e.g. the seed env that
+    # this toolkit migrates DATA OUT OF) lack it and should NOT get
+    # surfaced to project users.
+    env_names: list[str] = []
+    for name in all_env_names:
+        env_arn = f"arn:aws:airflow:{region}:{account_id}:environment/{name}"
+        try:
+            tags = mwaa.list_tags_for_resource(ResourceArn=env_arn).get("Tags", {}) or {}
+        except mwaa.exceptions.ClientError as exc:
+            LOG.warning("  = list_tags failed for %s: %s; treating as non-SMUS", name, exc)
+            continue
+        if "AmazonDataZoneDomain" in tags:
+            env_names.append(name)
+            LOG.info("  + SMUS-managed env (tagged AmazonDataZoneDomain=%s): %s",
+                     tags.get("AmazonDataZoneDomain"), name)
+        else:
+            LOG.info("  = skipping un-tagged MWAA env (likely external/legacy): %s", name)
+
+    if not env_names:
+        LOG.info("  = no SMUS-managed MWAA envs found in %s; skipping MWAAWebAccess inline", region)
+        # Drop any stale inline left from a prior run that did grant access.
+        try:
+            iam.delete_role_policy(RoleName=role_name, PolicyName="MWAAWebAccess")
+            LOG.info("  + dropped stale MWAAWebAccess inline (no SMUS envs to grant for)")
+        except iam.exceptions.NoSuchEntityException:
+            pass
+        except iam.exceptions.ClientError:
+            pass
+        return
+
+    env_arns = [
+        f"arn:aws:airflow:{region}:{account_id}:environment/{name}"
+        for name in env_names
+    ]
+    role_arn_patterns = [
+        f"arn:aws:airflow:{region}:{account_id}:role/{name}/*"
+        for name in env_names
+    ]
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "MWAAListEnvironments",
+                "Effect": "Allow",
+                "Action": "airflow:ListEnvironments",
+                "Resource": "*",
+            },
+            {
+                "Sid": "MWAAEnvScopedRead",
+                "Effect": "Allow",
+                "Action": [
+                    "airflow:GetEnvironment",
+                    "airflow:ListTagsForResource",
+                    "airflow:CreateCliToken",
+                    "airflow:InvokeRestApi",
+                ],
+                "Resource": env_arns,
+            },
+            {
+                "Sid": "MWAAWebUILogin",
+                "Effect": "Allow",
+                "Action": "airflow:CreateWebLoginToken",
+                "Resource": role_arn_patterns,
+            },
+        ],
+    }
+    iam.put_role_policy(
+        RoleName=role_name,
+        PolicyName="MWAAWebAccess",
+        PolicyDocument=json.dumps(policy),
+    )
+    LOG.info("  + MWAAWebAccess inline policy applied to %s (SMUS envs=%s)", role_name, env_names)
 
 
 def _ensure_kms_statement(kms_client, key_id: str, role_arn: str, account_id: str, region: str) -> None:
