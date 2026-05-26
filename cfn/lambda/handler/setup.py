@@ -559,6 +559,23 @@ def _smus_session_bootstrap(
     # without us having to know names at deploy time.
     _attach_mwaa_web_access_policy(role_name, account_id, region)
 
+    # 2b''. Re-tag the project user role with KmsKeyId.
+    #
+    # The default `SageMakerStudioProjectUserRolePolicy` (AWS-managed)
+    # has many KMS statements scoped to
+    # `arn:aws:kms:*:*:key/${aws:PrincipalTag/KmsKeyId}`. DataZone
+    # creates the role with `KmsKeyId=""` whenever the Tooling env was
+    # provisioned with `enableCmkSupport=false` (the default). With an
+    # empty tag, the resource ARN resolves to `.../key/` and matches
+    # no key — so JupyterLab fails with "S3 is unreachable" the moment
+    # it tries to read CMK-encrypted objects (notebooks, sample DAGs,
+    # Glue logs) under the project's prefix.
+    #
+    # We can't flip `enableCmkSupport` (not a user-param), so we patch
+    # the tag post-creation. Idempotent — leaves the tag alone if a
+    # value is already set, only fills empty.
+    _tag_role_with_tooling_kms(role_name, tooling_bucket)
+
     # 2c. KMS key policy on tooling bucket CMK.
     try:
         enc = s3.get_bucket_encryption(Bucket=tooling_bucket)
@@ -591,6 +608,57 @@ def _smus_session_bootstrap(
     _reregister_s3_prefixes(glue, lf, lf_reg_role_arn, region)
 
     LOG.info("Section 2: complete")
+
+
+def _tag_role_with_tooling_kms(role_name: str, tooling_bucket: str) -> None:
+    """Set the `KmsKeyId` principal tag on the project user role.
+
+    Reads the Tooling bucket's default-encryption KMS key (if any)
+    and writes its short id (UUID) into the role's `KmsKeyId` tag.
+    The `SageMakerStudioProjectUserRolePolicy` managed policy uses
+    this tag as a variable in its KMS resource ARNs — without a
+    valid value, every KMS-scoped statement evaluates to an
+    impossible ARN and JupyterLab can't decrypt existing
+    CMK-encrypted objects in the bucket ("S3 is unreachable").
+
+    No-ops when:
+      * The bucket has SSE-S3 (no CMK to scope to).
+      * The role already has a non-empty `KmsKeyId` tag (someone
+        explicitly set it to a different key).
+    """
+    iam = boto3.client("iam")
+    s3 = boto3.client("s3")
+
+    try:
+        enc = s3.get_bucket_encryption(Bucket=tooling_bucket)
+        rules = enc["ServerSideEncryptionConfiguration"]["Rules"]
+        kms_master = rules[0]["ApplyServerSideEncryptionByDefault"].get("KMSMasterKeyID", "")
+    except s3.exceptions.ClientError as exc:
+        LOG.warning("  KmsKeyId tag skipped: get-bucket-encryption failed: %s", exc)
+        return
+
+    if not kms_master:
+        LOG.info("  = bucket uses SSE-S3; clearing KmsKeyId tag is a no-op")
+        return
+
+    kms_short = kms_master.split("/")[-1]
+
+    try:
+        existing = iam.list_role_tags(RoleName=role_name).get("Tags", [])
+    except iam.exceptions.ClientError as exc:
+        LOG.warning("  KmsKeyId tag skipped: list_role_tags failed: %s", exc)
+        return
+
+    cur = next((t["Value"] for t in existing if t["Key"] == "KmsKeyId"), None)
+    if cur and cur != "":
+        if cur == kms_short:
+            LOG.info("  = role %s already tagged KmsKeyId=%s", role_name, kms_short)
+        else:
+            LOG.info("  = role %s has explicit KmsKeyId=%s; leaving as-is", role_name, cur)
+        return
+
+    iam.tag_role(RoleName=role_name, Tags=[{"Key": "KmsKeyId", "Value": kms_short}])
+    LOG.info("  + role %s tagged KmsKeyId=%s", role_name, kms_short)
 
 
 def _attach_mwaa_web_access_policy(role_name: str, account_id: str, region: str) -> None:
