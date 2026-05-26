@@ -282,6 +282,14 @@ Resources:
               - Name: 'maxWebservers'
                 Value: '2'
                 IsEditable: true
+              # Airflow 2.10.1 (the current MWAA default) requires
+              # schedulers > 1. Blueprint default is 1, so
+              # create-environment fails with: "Scheduler count must
+              # be greater than 1 for Airflow version 2.10.1." Pin to
+              # 2 (the minimum supported value).
+              - Name: 'schedulers'
+                Value: '2'
+                IsEditable: true
 
         - Name: 'OnDemand MLExperiments'
           EnvironmentBlueprintId: !Ref MLExperimentsId

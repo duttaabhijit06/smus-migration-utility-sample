@@ -225,11 +225,35 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      # Tooling bucket uses SSE-S3 (AWS-managed) instead of CMK.
+      #
+      # Why not CMK? The Workflows blueprint env CFN template has a
+      # `kmsKeyArn` parameter (description: "The KMS key configured
+      # for the DataZone project"), but DataZone does NOT propagate
+      # the blueprint regional `kmsKeyArn` parameter through to env
+      # stacks — verified empirically by inspecting the live Tooling
+      # env stack (kmsKeyArn=""). Setting `kmsKeyArn` as a regional
+      # parameter on the Workflows blueprint is silently ignored.
+      # Setting it as a project-profile env override is rejected
+      # ("parameter not present in the blueprint").
+      #
+      # MWAA validates that the env's encryption matches the source
+      # bucket's encryption. If the bucket has CMK and the env has
+      # null, MWAA refuses with: "KMS key used for encrypting S3
+      # bucket ... is not compatible with the encryption
+      # configuration (null) of the environment. Consider providing
+      # the same KMS key for environment encryption or use Amazon S3
+      # Key or AWS Managed Key for bucket encryption."
+      #
+      # Since DataZone won't pass the CMK to MWAA's KmsKey property,
+      # the only path that unblocks Workflows env creation is to use
+      # SSE-S3 on the bucket (AWS managed key). All other blueprints
+      # that consume this bucket (Tooling, Lakehouse Database,
+      # Redshift, EMR, etc.) work fine under SSE-S3.
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
-              SSEAlgorithm: 'aws:kms'
-              KMSMasterKeyID: !GetAtt rSUSBPToolingKMSKey.Arn
+              SSEAlgorithm: 'AES256'
 
   rSUSBPToolingBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -370,12 +394,14 @@ Resources:
             S3Location: !Sub 's3://${rSUSBPToolingBucket}'
             Subnets: !Ref pSUSToolingBPSubnets
             VpcId: !Ref pSUSToolingBPVpcId
-            # Pass the Tooling bucket's KMS key so MWAA's
-            # create-environment uses the same key for env encryption.
-            # Without this, MWAA refuses with: "KMS key used for
-            # encrypting S3 bucket ... is not compatible with the
-            # encryption configuration (null) of the environment."
-            KmsKeyArn: !GetAtt rSUSBPToolingKMSKey.Arn
+            # NOTE: We tested setting `kmsKeyArn` (and `KmsKeyArn`)
+            # here to make MWAA env-create pick up the Tooling bucket
+            # CMK. DataZone accepts the parameter but does NOT
+            # propagate it to the env CFN stack — verified by
+            # inspecting live env stack params (kmsKeyArn always "").
+            # The Tooling bucket therefore uses SSE-S3 (see bucket
+            # definition above) so MWAA env creation can succeed
+            # without a matching CMK on the env.
       EnabledRegions:
         - !Ref 'AWS::Region'
 
